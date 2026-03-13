@@ -1,64 +1,64 @@
-# Contributing [in developement]
-
-There is more than one way of contributing to istSOS4.
-Here we will focus on contributions centered
-around the main istSOS4 source code.
-You can also report issues, plan new features,
-or explore <https://github.com/istSOS/istSOS4/issues>.
-
-## Changing code and documentation
-
-To contribute changes to istSOS GitHub repository, use a
-"fork and pull request" workflow. This [guide](./doc/development/github_guide.md)
-leads you through a first time setup and shows how to create a pull request.
-
-To contribute effectively, please familiarize yourself with our
-[Programming Style Guide](./doc/development/style_guide.md).
-
-### Testing changes
-
-Testing helps to ensure that the changes work well with the rest
-of the project. While there are many different ways to test,
-usually you will want to compile the source code (see below),
-add test code (using _grass.gunittest_ or pytest), and run code
-linters (automated code quality checks).
-
-There is a series of automated checks which will run on your pull request
-after you create one. You don't need to run all these
-checks locally and, indeed, some of them may fail for your code. This is a part of
-the standard iterative process of integrating changes into the main code,
-so if that happens, just see the error messages, go back to your code
-and try again. If you are not sure what to do, let others know in a pull
-request comment.
-
-Note that there are some steps you can do locally to improve your code.
-For Python, run `black .` to apply standardized formatting. You can
-also run linter tools such as Pylint which will suggest different improvements
-to your code.
-
-## Compilation
-
-More often than not, in order to test the changes, you need to create
-a runnable binary program from the source code,
-using the so-called "compilation step". While the
-source code consists of thousands of C and Python files (plus HTML
 documentation and other files), the included "makefiles" tell the build system to
-generate binaries from the source code in the correct order, render the
-manual pages, etc.
-
-The way to install the compiler tools and Python depends on the operating
-system. To make this easier, we have collected copy-paste instructions
 to install dependencies and compile GRASS source code for most operating systems.
-Please see our dedicated wiki:
+# Contributing
 
-[Compile and install instructions](https://grasswiki.osgeo.org/wiki/Compile_and_Install)
+Thanks for your interest in contributing to istSOS4.
 
-## About source code
+## Ways to contribute
 
-GRASS GIS is written in more than one programming language, but you need
-to know only the language relevant to your contribution. While much
-of the source code is written in C, a significant portion is written in Python.
-A compiler is needed to convert the C and C++ source code into executable
-files ("binaries"). In contrast, Python is an interpreted language that
-can only be executed with Python software. There is also documentation
-in HTML files and other files in the GRASS GIS source code.
+- Report bugs and feature requests: <https://github.com/istSOS/istSOS4/issues>
+- Improve API code in `api/`
+- Improve SQL schema and migrations in `database/`
+- Improve docs and tutorials in `docs/`
+
+## Development setup
+
+1. Fork and clone the repository.
+2. Copy environment variables:
+	```sh
+	cp .env.example .env
+	```
+	If `.env.example` is not present in your branch yet, create `.env` from project documentation and existing defaults.
+3. Start local services:
+	```sh
+	docker compose -f dev_docker-compose.yml up -d
+	```
+
+## Code changes
+
+- Keep changes focused and minimal.
+- Follow existing project patterns and naming conventions.
+- Update documentation when behavior or configuration changes.
+- Avoid unrelated refactors in the same pull request.
+
+## Testing
+
+Run relevant tests locally before opening a pull request.
+
+Examples:
+
+```sh
+cd api
+PYTHONPATH=/home/deadpool/ist/istSOS4/api python -m unittest app.sta2rest.test -v
+python -m pytest -q
+```
+
+If you add a fix for a specific bug, include a focused regression test when possible.
+
+## Pull requests
+
+- Use a clear branch name (for example `fix/<short-description>`).
+- Keep commit messages short and descriptive.
+- Include:
+  - Problem summary
+  - Root cause
+  - What changed
+  - How you tested it (terminal output or test command)
+
+## Security and sensitive data
+
+- Never commit secrets or private credentials.
+- Keep `.env` out of git.
+- Use safe defaults for local development only.
+
+Thanks for helping improve istSOS4.
