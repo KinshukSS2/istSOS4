@@ -270,6 +270,9 @@ def _fake_pool_for_provisioning(
     mock_conn = AsyncMock()
     mock_conn.transaction = MagicMock(side_effect=fake_transaction)
     mock_conn.execute = AsyncMock(return_value=None)
+    mock_conn.fetchval = AsyncMock(
+        side_effect=lambda _sql, user_id: f"/Users({user_id})"
+    )
     if insert_result is not None:
         mock_conn.fetchrow = AsyncMock(
             side_effect=[fetchrow_result, dup_email_result, insert_result]
@@ -283,6 +286,7 @@ def _fake_pool_for_provisioning(
 
     mock_pool = MagicMock()
     mock_pool.acquire = mock_acquire
+    mock_pool.conn = mock_conn
     return mock_pool
 
 
@@ -324,11 +328,13 @@ def app_client():
         yield TestClient(app)
 
 
-def test_login_requires_dataset_id_and_policy_id(app_client):
+def test_login_without_dataset_or_role_still_redirects(app_client):
+    # dataset_id and requested_role are optional: a plain sign-in request
+    # goes straight to the provider and the admin assigns both on approval.
     r = app_client.get(
         "/istsos4/v1.1/auth/testoidc/login", follow_redirects=False
     )
-    assert r.status_code == 422  # missing required query params
+    assert r.status_code == 302
 
 
 def test_login_rejects_unconfigured_provider(app_client):
@@ -354,23 +360,47 @@ def test_login_redirects_and_stores_selection_in_session(app_client):
     assert "session" in r.cookies
 
 
-def test_callback_without_prior_login_returns_400(app_client):
-    # Hitting /callback directly, with no session state from /login first.
+def test_callback_without_prior_login_still_registers_pending_user(app_client):
+    # Hitting /callback with no session state from /login first means no
+    # dataset_id / requested_role were stashed. That is allowed now: the
+    # account is created pending, with both left for the admin to assign.
+    import app.db.oidc_user_crud as crud_module
     import app.v1.endpoints.create.oidc_login as route_module
 
     fake_client = _make_fake_oidc_client(
-        {"userinfo": {"sub": "x", "name": "x"}}
+        {
+            "userinfo": {
+                "sub": "x-sub",
+                "email": "x@example.org",
+                "name": "x",
+            }
+        }
+    )
+    pool = _fake_pool_for_provisioning(
+        fetchrow_result=None,
+        insert_result={
+            "id": 9,
+            "username": "x",
+            "role": "pending",
+            "uri": "/Users(9)",
+            "auth_provider": "testoidc",
+            "external_sub_id": "x-sub",
+        },
     )
 
     with patch.object(
         route_module.oauth, "create_client", return_value=fake_client
-    ):
+    ), patch.object(crud_module, "get_pool", AsyncMock(return_value=pool)):
         r = app_client.get(
             "/istsos4/v1.1/auth/testoidc/callback?code=abc&state=xyz",
             follow_redirects=False,
         )
-    assert r.status_code == 400
-    assert "dataset" in r.json()["detail"].lower()
+
+    assert r.status_code == 202
+    insert_args = pool.conn.fetchrow.call_args_list[-1].args
+    # trailing INSERT params: dataset_id, requested_role, possible_duplicate_of
+    assert insert_args[-3] is None
+    assert insert_args[-2] is None
 
 
 def test_callback_new_identity_creates_pending_user_and_returns_202(app_client):

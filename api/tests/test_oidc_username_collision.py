@@ -79,6 +79,10 @@ def _make_mock_pool(side_effect):
     mock_conn = AsyncMock()
     mock_conn.fetchrow = AsyncMock(side_effect=side_effect)
     mock_conn.execute = AsyncMock(return_value=None)
+    # create_pending_oidc_user backfills uri via conn.fetchval(UPDATE ... RETURNING uri)
+    mock_conn.fetchval = AsyncMock(
+        side_effect=lambda _sql, user_id: f"/Users({user_id})"
+    )
     mock_conn.transaction = MagicMock(side_effect=_fake_transaction)
 
     @asynccontextmanager

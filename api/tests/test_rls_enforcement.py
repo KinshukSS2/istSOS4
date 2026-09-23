@@ -21,7 +21,7 @@ exactly how the bug this migration fixes went unnoticed: the old
 ``TO <username>`` policies looked correct at the SQL-authoring level and
 simply never matched a real session, for any user, ever.
 
-test_datastream_rls_filters_by_dataset_id_per_user connects to a real
+test_datastream_rls_filters_by_network_per_user connects to a real
 database and proves enforcement itself: that two sessions sharing the
 same PostgreSQL group role ("user") but different individual identities
 see different, correctly filtered rows. That per-user differentiation
@@ -110,20 +110,38 @@ async def _connect_or_skip():
 
 
 async def _seed(connection):
-    """Two viewer users in two different datasets, and one Datastream row
-    per dataset cloned from real seed data so every NOT NULL FK is valid.
+    """Two viewer users, each scoped to a different real Network, plus one
+    existing Datastream from each of those Networks.
+
+    A user's scope is the Network *name* held in User.dataset_id; the RLS
+    policies resolve it through current_app_user_network_id(). No Datastream
+    is inserted -- the seed data already has rows in several Networks, and
+    reusing them avoids faking every NOT NULL FK.
 
     Switches to the administrator PG role first, same as every real
-    privileged write in this codebase -- the pool's raw connection is not
-    privileged enough for this INSERT on its own.
+    privileged write in this codebase.
     """
     await set_role(connection, {"role": "administrator"})
 
-    template_id = await connection.fetchval(
-        'SELECT id FROM sensorthings."Datastream" ORDER BY id LIMIT 1;'
+    nets = await connection.fetch(
+        """
+        SELECT n.name, min(d.id) AS ds_id
+        FROM sensorthings."Network" n
+        JOIN sensorthings."Datastream" d ON d.network_id = n.id
+        GROUP BY n.name
+        ORDER BY n.name
+        LIMIT 2;
+        """
     )
-    if template_id is None:
-        pytest.skip("no seed Datastream row to clone from -- run dummy_data first")
+    if len(nets) < 2:
+        pytest.skip(
+            "need two Networks that each have a Datastream -- run dummy_data "
+            "with NETWORK=1"
+        )
+    (net_a, ds_a), (net_b, ds_b) = (
+        (nets[0]["name"], nets[0]["ds_id"]),
+        (nets[1]["name"], nets[1]["ds_id"]),
+    )
 
     user_a = await connection.fetchval(
         """
@@ -131,7 +149,7 @@ async def _seed(connection):
         VALUES ($1, 'viewer', $2) RETURNING id;
         """,
         f"{_MARKER}_alice",
-        f"{_MARKER}_dataset_a",
+        net_a,
     )
     user_b = await connection.fetchval(
         """
@@ -139,41 +157,12 @@ async def _seed(connection):
         VALUES ($1, 'viewer', $2) RETURNING id;
         """,
         f"{_MARKER}_bob",
-        f"{_MARKER}_dataset_b",
-    )
-
-    ds_a = await connection.fetchval(
-        """
-        INSERT INTO sensorthings."Datastream"
-            (name, description, "unitOfMeasurement", "observationType",
-             thing_id, sensor_id, observedproperty_id, network_id, dataset_id)
-        SELECT $1, description, "unitOfMeasurement", "observationType",
-               thing_id, sensor_id, observedproperty_id, network_id, $2
-        FROM sensorthings."Datastream" WHERE id = $3
-        RETURNING id;
-        """,
-        f"{_MARKER}_ds_a",
-        f"{_MARKER}_dataset_a",
-        template_id,
-    )
-    ds_b = await connection.fetchval(
-        """
-        INSERT INTO sensorthings."Datastream"
-            (name, description, "unitOfMeasurement", "observationType",
-             thing_id, sensor_id, observedproperty_id, network_id, dataset_id)
-        SELECT $1, description, "unitOfMeasurement", "observationType",
-               thing_id, sensor_id, observedproperty_id, network_id, $2
-        FROM sensorthings."Datastream" WHERE id = $3
-        RETURNING id;
-        """,
-        f"{_MARKER}_ds_b",
-        f"{_MARKER}_dataset_b",
-        template_id,
+        net_b,
     )
     return user_a, user_b, ds_a, ds_b
 
 
-def test_datastream_rls_filters_by_dataset_id_per_user():
+def test_datastream_rls_filters_by_network_per_user():
     async def _run():
         connection = await _connect_or_skip()
         try:
@@ -199,8 +188,8 @@ def test_datastream_rls_filters_by_dataset_id_per_user():
 
                 assert visible_ids == {ds_a}, (
                     "viewer session for user_a must see only its own "
-                    f"dataset's Datastream ({ds_a}), not {ds_b} -- got "
-                    f"{visible_ids}. If this includes both ids, per-dataset "
+                    f"Network's Datastream ({ds_a}), not {ds_b} -- got "
+                    f"{visible_ids}. If this includes both ids, per-Network "
                     "filtering has broken; if it's empty, the static "
                     "policy itself stopped matching."
                 )
