@@ -71,10 +71,9 @@ class RestrictedRegistrationRequest(BaseModel):
     ------
     username:       Desired login handle.  Uniqueness enforced at the DB level.
     password:       Plain-text password; hashed with bcrypt before storage.
-    dataset_id:     Human-readable or URI identifier for the STAC dataset the
-                    applicant wants access to.
-    odrl_policy_id: Identifier of the ODRL policy document that governs access
-                    to the requested dataset.
+    dataset_id:     Name of the Network the applicant wants scoped access to.
+                    Optional -- omit for unrestricted access. Confirmed or
+                    overridden by the administrator at approval time.
     requested_role: RBAC role the applicant is asking to be granted. An
                     administrator reviewing the request sees this as the
                     default at approval time (PATCH .../policy-approval)
@@ -93,8 +92,7 @@ class RestrictedRegistrationRequest(BaseModel):
                 {
                     "username": "jdoe",
                     "password": "Str0ng!Pass",
-                    "dataset_id": "stac://alpine-snow-2024",
-                    "odrl_policy_id": "odrl:policy:cc-by-nc",
+                    "dataset_id": "IDROLOGIA",
                     "requested_role": "viewer",
                     "explanation": "Requesting access for a climate research project.",
                     "contact_info": {"company": "SUPSI", "telegram": "@jdoe"},
@@ -116,26 +114,20 @@ class RestrictedRegistrationRequest(BaseModel):
         ),
         examples=["Str0ng!Pass"],
     )
-    dataset_id: str = Field(
+    dataset_id: str | None = Field(
+        default=None,
         description=(
-            "Dataset the applicant is requesting access to. Persisted on "
-            "the User row (not just the audit log) so an administrator "
-            "reviewing the pending queue can see it, and forwarded to the "
-            "RESTRICTED_REQUEST audit event."
+            "Name of the Network the applicant is requesting scoped access "
+            "to. Optional -- omit for unrestricted access. Persisted on the "
+            "User row so an administrator reviewing the pending queue can "
+            "see it, and forwarded to the RESTRICTED_REQUEST audit event."
         ),
-        examples=["stac://alpine-snow-2024"],
-    )
-    odrl_policy_id: str = Field(
-        description=(
-            "ODRL policy document identifier governing that dataset. Same "
-            "persistence as dataset_id; not parsed or resolved by this API."
-        ),
-        examples=["odrl:policy:cc-by-nc"],
+        examples=["IDROLOGIA"],
     )
     requested_role: str = Field(
         description=(
             "RBAC role you are asking to be granted: one of viewer, "
-            "editor, obs_manager, sensor, qc, odrl_governed. A stated "
+            "editor, obs_manager, sensor, qc, custom. A stated "
             "preference, not a grant -- the administrator reviewing your "
             "request sees this as the default and can approve it as-is "
             "or assign a different role."

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import logging
 from datetime import datetime
 
 import asyncpg
@@ -39,9 +40,9 @@ from .functions import (
     set_commit,
     update_datastream_last_foi_id,
 )
-from app.v1.endpoints.functions import set_role
 
 v1 = APIRouter()
+logger = logging.getLogger(__name__)
 
 user = Header(default=None, include_in_schema=False)
 message = Header(default=None, alias="commit-message", include_in_schema=False)
@@ -52,7 +53,15 @@ if AUTHORIZATION:
     user = Depends(get_current_user)
 
 if VERSIONING or AUTHORIZATION:
-    message = Header(alias="commit-message")
+    # Optional, not required. A 'sensor' account (the role whose whole job is
+    # bulk-pushing observations here) is forbidden by set_commit() from
+    # providing a commit message at all -- declaring the header required made
+    # /CreateObservations return 422 with no header and 403 with one, locking
+    # sensors out of the endpoint entirely. The sibling create paths
+    # (observation.py, bulk_observation.py) already declare it optional and
+    # let set_commit() enforce the per-role rule (sensor/qc -> must be absent;
+    # everyone else -> must be present). Match them.
+    message = Header(None, alias="commit-message")
 
 PAYLOAD_EXAMPLE = [
     {
@@ -180,7 +189,10 @@ async def data_array_observation(
                             status.HTTP_503_SERVICE_UNAVAILABLE,
                             "Database temporarily unavailable",
                         )
-                    except Exception as e:
+                    except Exception:
+                        logger.exception(
+                            "data-array observation insert failed"
+                        )
                         response_urls.append("error")
 
     return JSONResponse(
@@ -235,7 +247,7 @@ async def insertDataArrayObservation(
                     check_iot_id_in_payload(
                         obs["FeatureOfInterest"], "FeatureOfInterest"
                     )
-                    select_query = f"""
+                    select_query = """
                         SELECT last_foi_id
                         FROM sensorthings."Datastream"
                         WHERE id = $1::bigint;

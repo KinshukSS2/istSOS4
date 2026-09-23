@@ -22,7 +22,7 @@ Flow
     ``contact_info`` dict  +  ``{"explanation": request.explanation}``.
 3.  Open a connection from the write pool inside a single DB transaction:
     a.  INSERT a new row into ``sensorthings."User"`` with role='pending'
-        and status='active'.  RETURNING id to capture the auto-assigned PK.
+        and status='pending'.  RETURNING id to capture the auto-assigned PK.
     b.  UPDATE the new row's ``uri`` column to ``/Users(<id>)``.
     c.  Call ``log_audit_event`` (on the same connection / same transaction)
         with action_type='RESTRICTED_REQUEST' so the registration is
@@ -161,10 +161,10 @@ async def register_request(request: RestrictedRegistrationRequest):
                 #
                 #     - No existing row       -> INSERT (fresh registration).
                 #     - existing, 'rejected'   -> UPDATE (re-application:
-                #       overwrite password/contact, status back to 'active',
-                #       role left untouched — still 'pending').
+                #       overwrite password/contact, role + status back to
+                #       'pending').
                 #     - existing, anything else -> 409 Conflict (unchanged
-                #       behaviour for active/pending/approved usernames).
+                #       behaviour for active/pending usernames).
                 existing = await conn.fetchrow(
                     """
                     SELECT id, status
@@ -183,52 +183,49 @@ async def register_request(request: RestrictedRegistrationRequest):
 
                 if existing is not None:
                     # Re-application: overwrite the previously-rejected row.
-                    # dataset_id/odrl_policy_id/requested_role are all
-                    # overwritten too -- a re-applying user is explicitly
-                    # allowed to request a different dataset/policy/role
-                    # than their rejected attempt.
+                    # Back to role='pending' / status='pending'; dataset_id
+                    # and requested_role are overwritten too -- a re-applying
+                    # user may request a different network/role than their
+                    # rejected attempt.
                     row = await conn.fetchrow(
                         """
                         UPDATE sensorthings."User"
                         SET password        = $1,
                             contact         = $2::jsonb,
-                            status          = 'active',
+                            role            = 'pending',
+                            status          = 'pending',
                             dataset_id      = $3,
-                            odrl_policy_id  = $4,
-                            requested_role  = $5
-                        WHERE id = $6
+                            requested_role  = $4
+                        WHERE id = $5
                         RETURNING id
                         """,
                         hashed_password,
                         contact_json,
                         request.dataset_id,
-                        request.odrl_policy_id,
                         request.requested_role,
                         existing["id"],
                     )
                 else:
                     # 3a. INSERT the new User row.
-                    #     role='pending'  → zero operational privileges.
-                    #     status='active' → account exists and can be found by admin.
-                    #     dataset_id/odrl_policy_id/requested_role persisted
-                    #     here (not just AuditLog) so an admin reviewing
-                    #     GET /Users can see what was actually requested
-                    #     without a manual join.
+                    #     role='pending' / status='pending' → not usable
+                    #     until an administrator approves. dataset_id and
+                    #     requested_role are persisted here (not just in the
+                    #     AuditLog) so an admin reviewing GET /Users sees
+                    #     what was requested without a manual join.
                     #     The RETURNING clause gives us the auto-assigned PK.
                     row = await conn.fetchrow(
                         """
                         INSERT INTO sensorthings."User"
                             (username, password, role, status, contact,
-                             dataset_id, odrl_policy_id, requested_role)
+                             dataset_id, requested_role)
                         VALUES
-                            ($1, $2, 'pending', 'active', $3::jsonb, $4, $5, $6)
+                            ($1, $2, 'pending', 'pending', $3::jsonb, $4, $5)
                         RETURNING id
                         """,
                         request.username,
                         hashed_password,
                         contact_json,
                         request.dataset_id,
-                        request.odrl_policy_id,
                         request.requested_role,
                     )
                 new_user_id: int = row["id"]
@@ -252,7 +249,6 @@ async def register_request(request: RestrictedRegistrationRequest):
                     action_type=AUDIT_ACTION_RESTRICTED_REQUEST,
                     actor_id=new_user_id,
                     dataset_id=request.dataset_id,
-                    odrl_policy_id=request.odrl_policy_id,
                     payload={
                         "explanation": request.explanation,
                         "requested_role": request.requested_role,
@@ -261,11 +257,11 @@ async def register_request(request: RestrictedRegistrationRequest):
 
         logger.info(
             "Restricted registration: new pending user '%s' (id=%d) "
-            "requested access to dataset '%s' under policy '%s'.",
+            "requested network '%s', role '%s'.",
             request.username,
             new_user_id,
             request.dataset_id,
-            request.odrl_policy_id,
+            request.requested_role,
         )
 
         return JSONResponse(

@@ -17,7 +17,7 @@ import re
 from app import POSTGRES_PORT_WRITE
 from app.db.asyncpg_db import get_pool, get_pool_w
 from app.oauth import get_current_user
-from app.v1.endpoints.exceptions import BadRequest, Conflict
+from app.v1.endpoints.exceptions import BadRequest
 from app.v1.endpoints.functions import set_role
 from app.v1.endpoints.openapi_responses import merge
 from asyncpg.exceptions import DuplicateObjectError, InsufficientPrivilegeError
@@ -36,9 +36,7 @@ PAYLOAD_EXAMPLE = {
         "type": "custom",
         "policy": {
             "datastream": {
-                "select": """
-                    network = 'IDROLOGIA'
-                """,
+                "select": "name LIKE 'meteo_%'",
             },
         },
     },
@@ -51,50 +49,25 @@ PAYLOAD_EXAMPLE = {
     tags=["Policies"],
     summary="Create a Policy",
     description=(
-        "Create a named, hand-specified row-level-security policy for the "
-        "given users. `permissions.type` must be `custom` -- viewer, "
-        "editor, obs_manager, sensor and qc all receive row-level access "
-        "automatically from a static policy the moment their role is set "
-        "(see `007_session_scoped_rls_policies.sql`), so this endpoint has "
-        "nothing left to do for them."
+        "Create a row-level-security policy for the given users.\n\n"
+        "`viewer` / `editor` / `obs_manager` / `sensor` / `qc` are already "
+        "covered by the static per-role policies from "
+        "`006_session_scoped_rls_policies.sql`; the endpoint returns 200 "
+        "and creates nothing for them.\n\n"
+        "`custom` builds hand-specified policies from `permissions.policy`. "
+        "It applies only to users whose role is `custom` (those have no "
+        "blanket grant), and each policy is scoped to the `user` group role "
+        "plus an identity check on `current_app_user_id()`, so it works "
+        "even though istSOS users are not PostgreSQL roles."
     ),
     status_code=status.HTTP_201_CREATED,
     responses=merge(
         {
-            201: {"description": "Created. Response body is empty."},
-            # This handler's own `except Exception as e:` catches
-            # everything -- including BadRequest and Conflict, which are
-            # STAError subclasses meant to reach the app-level handler and
-            # produce {"code","type","message"} with their own status
-            # (409 for Conflict). Caught here first, every failure path
-            # -- malformed payload, a role covered by a static policy
-            # already, a duplicate policy -- is flattened to 400 with a
-            # plain {"message"} body instead.
-            400: {
-                "description": (
-                    "Malformed payload, `permissions.type` is not "
-                    "`custom`, or a user already has a policy. All "
-                    "collapse to 400 here regardless of their semantic "
-                    "cause -- see the code comment above this response."
-                ),
-                "content": {
-                    "application/json": {
-                        "example": {"message": "User cp1 has already a policy."}
-                    }
-                },
-            },
-            403: {
-                "description": "The caller is not an administrator.",
-                "content": {
-                    "application/json": {"example": {"message": "Insufficient privileges."}}
-                },
-            },
-            409: {
-                "description": "The named policy already exists at the database level.",
-                "content": {
-                    "application/json": {"example": {"message": "Policy already exists."}}
-                },
-            },
+            200: {"description": "Role already covered by a static RLS policy; nothing created."},
+            201: {"description": "Custom policy created. Response body is empty."},
+            400: {"description": "Malformed payload or unknown `permissions.type`."},
+            403: {"description": "The caller is not an administrator."},
+            409: {"description": "A policy of that name already exists, or the user already has one."},
         }
     ),
 )
@@ -109,7 +82,6 @@ async def create_policy(
 
         async with pgpool.acquire() as connection:
             async with connection.transaction():
-                role_switched = False
                 if (
                     "users" not in payload
                     or "name" not in payload
@@ -127,38 +99,36 @@ async def create_policy(
                         raise InsufficientPrivilegeError
 
                     await set_role(connection, current_user)
-                    role_switched = True
 
                 permission_type = payload["permissions"].get("type")
 
-                # viewer/editor/obs_manager/sensor/qc access is granted by
-                # the static, group-scoped policies from
-                # 007_session_scoped_rls_policies.sql the moment a user's
-                # role is set -- that migration DROPs the per-user
-                # viewer_policy()/editor_policy()/obs_manager_policy()/
-                # sensor_policy()/qc_policy() functions this endpoint used
-                # to call, since there is nothing left for them to do.
-                # 'custom' is the only type this endpoint still creates.
-                if permission_type != "custom":
-                    raise BadRequest(
-                        "permissions.type must be 'custom'. viewer, editor, "
-                        "obs_manager, sensor and qc all receive row-level "
-                        "access automatically from a static policy as soon "
-                        "as the role is set -- no explicit policy is "
-                        "needed, or supported, for them."
+                # The five role types are already enforced by the static
+                # per-role policies from 006_session_scoped_rls_policies.sql,
+                # which apply the moment set_role() runs. Accept them so the
+                # API contract is unchanged, but there is nothing to create.
+                STATIC_ROLE_TYPES = {
+                    "viewer",
+                    "editor",
+                    "obs_manager",
+                    "sensor",
+                    "qc",
+                }
+                if permission_type in STATIC_ROLE_TYPES:
+                    return JSONResponse(
+                        status_code=status.HTTP_200_OK,
+                        content={
+                            "message": (
+                                f"Role '{permission_type}' is covered by a "
+                                "static RLS policy; no explicit policy created."
+                            )
+                        },
                     )
 
-                for user in payload["users"]:
-                    query = """
-                        SELECT COUNT(*)
-                        FROM pg_policies
-                        WHERE $1 = ANY (roles)
-                    """
-                    result = await connection.fetchval(query, user)
-                    if result > 0:
-                        raise Conflict(
-                            f"User {user} has already a policy."
-                        )
+                if permission_type != "custom":
+                    raise BadRequest(
+                        "permissions.type must be one of: viewer, editor, "
+                        "obs_manager, sensor, qc, custom."
+                    )
 
                 await create_policies(
                     connection,
@@ -219,7 +189,37 @@ async def create_policies(connection, users, policies, name):
     if not isinstance(policies, dict) or len(policies) == 0:
         raise ValueError("Policies must not be empty")
 
-    quoted_users = ", ".join(quote_identifier(user) for user in users)
+    # istSOS users are not PostgreSQL roles, so a policy cannot be scoped
+    # ``TO <username>``. Instead every custom policy is scoped to the "user"
+    # group role and gated on the caller's application identity, read from
+    # the app.current_user_id session claim via current_app_user_id()
+    # (the same mechanism 006_session_scoped_rls_policies.sql uses).
+    #
+    # Only 'custom'-role users are allowed here: they get NO blanket grant
+    # from the static policies, so these hand-written rules are their entire
+    # access. A viewer/editor already has group-wide access, so a custom
+    # policy for them would only ever widen it -- refused.
+    rows = await connection.fetch(
+        'SELECT username, id, role FROM sensorthings."User" '
+        "WHERE username = ANY($1::text[])",
+        list(users),
+    )
+    found = {r["username"]: r for r in rows}
+    missing = [u for u in users if u not in found]
+    if missing:
+        raise ValueError(f"Unknown user(s): {', '.join(missing)}")
+    not_custom = [u for u in users if found[u]["role"] != "custom"]
+    if not_custom:
+        raise ValueError(
+            "permissions.type 'custom' only applies to users whose role is "
+            f"'custom'. These are not: {', '.join(not_custom)}."
+        )
+
+    user_ids = sorted(int(found[u]["id"]) for u in users)
+    id_array = "ARRAY[" + ", ".join(str(i) for i in user_ids) + "]::bigint[]"
+    identity_clause = (
+        f"sensorthings.current_app_user_id() = ANY ({id_array})"
+    )
 
     for table_key, operations in policies.items():
         table = table_mapping.get(table_key)
@@ -240,31 +240,32 @@ async def create_policies(connection, users, policies, name):
                 f"{name}_{table.lower()}_{operation_lc}"
             )
             safe_condition = validate_policy_expression(condition)
+            predicate = f"{identity_clause} AND ({safe_condition})"
 
             if operation_lc in {"select", "delete"}:
                 query = f"""
                     CREATE POLICY {safe_name}
                     ON sensorthings.{safe_table}
                     FOR {operation_lc.upper()}
-                    TO {quoted_users}
-                    USING ({safe_condition});
+                    TO "user"
+                    USING ({predicate});
                 """
             elif operation_lc == "insert":
                 query = f"""
                     CREATE POLICY {safe_name}
                     ON sensorthings.{safe_table}
                     FOR INSERT
-                    TO {quoted_users}
-                    WITH CHECK ({safe_condition});
+                    TO "user"
+                    WITH CHECK ({predicate});
                 """
             else:
                 query = f"""
                     CREATE POLICY {safe_name}
                     ON sensorthings.{safe_table}
                     FOR {operation_lc.upper()}
-                    TO {quoted_users}
-                    USING ({safe_condition})
-                    WITH CHECK ({safe_condition});
+                    TO "user"
+                    USING ({predicate})
+                    WITH CHECK ({predicate});
                 """
 
             await connection.execute(query)

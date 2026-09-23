@@ -23,18 +23,17 @@ app.oidc_providers.normalize_claims).
 
 Flow
 ----
-1. GET /auth/{provider}/login?dataset_id=...&odrl_policy_id=...&requested_role=...
-   The caller (whatever frontend is driving this) has already let the
-   user pick a dataset, the ODRL policy they're agreeing to, and the RBAC
-   role they want -- exactly like POST /Register already requires. An
-   OAuth login is a plain browser redirect with no request body, so
-   there's nowhere to carry that selection except through the round trip
-   itself: it's stashed in the server-side session (see the
-   SessionMiddleware registration in app.main) before redirecting to the
-   provider, the same place Authlib already stores its own state/nonce.
+1. GET /auth/{provider}/login?dataset_id=...&requested_role=...
+   The caller (whatever frontend is driving this) may let the user pick a
+   Network to be scoped to and the RBAC role they want -- both optional,
+   mirroring POST /Register. An OAuth login is a plain browser redirect
+   with no request body, so that selection is stashed in the server-side
+   session (see the SessionMiddleware registration in app.main) before
+   redirecting to the provider, the same place Authlib already stores its
+   own state/nonce.
 2. Provider redirects back to /auth/{provider}/callback with a code.
 3. Exchange the code for a token; extract identity claims.
-4. Read the dataset_id/odrl_policy_id/requested_role back out of the session.
+4. Read the dataset_id/requested_role back out of the session.
 5. Look up (auth_provider, external_sub_id):
    - Unknown identity            -> create_pending_oidc_user(), tell the
      caller to wait for admin approval. No token issued here -- OIDC login
@@ -78,11 +77,10 @@ from fastapi.responses import JSONResponse
 v1 = APIRouter()
 logger = logging.getLogger(__name__)
 
-# Session keys used to carry the user's dataset/policy selection across the
-# redirect round trip -- namespaced so they can't collide with whatever
-# Authlib itself stores in the same session (its state/nonce bookkeeping).
+# Session keys used to carry the user's selection across the redirect round
+# trip -- namespaced so they can't collide with whatever Authlib itself
+# stores in the same session (its state/nonce bookkeeping).
 _SESSION_DATASET_KEY = "istsos_oidc_dataset_id"
-_SESSION_POLICY_KEY = "istsos_oidc_odrl_policy_id"
 _SESSION_ROLE_KEY = "istsos_oidc_requested_role"
 
 
@@ -142,12 +140,10 @@ def _client_for(provider: str):
         "from this page's own origin, and the provider will reject it with "
         "a CORS error before any redirect happens. Copy the constructed "
         "URL and open it in a browser tab instead.\n\n"
-        "`dataset_id`, `odrl_policy_id` and `requested_role` are required "
-        "for the same reason `POST /Register` requires them: the caller "
-        "has already let the user choose a dataset, agree to a policy, "
-        "and state the role they want. A redirect has no request body, "
-        "so the selection is stashed in the server-side session here and "
-        "read back by `/callback`."
+        "`dataset_id` (a Network name) and `requested_role` are optional, "
+        "mirroring `POST /Register`. A redirect has no request body, so "
+        "any selection is stashed in the server-side session here and read "
+        "back by `/callback`."
     ),
     responses=merge(
         {
@@ -166,7 +162,7 @@ def _client_for(provider: str):
                     "application/json": {
                         "example": {
                             "message": "Invalid role. Supported roles are: "
-                            "editor, obs_manager, odrl_governed, qc, sensor, viewer"
+                            "editor, obs_manager, custom, qc, sensor, viewer"
                         }
                     }
                 },
@@ -186,42 +182,40 @@ async def oidc_login(
         ),
         examples=["google"],
     ),
-    dataset_id: str = Query(
-        ...,
-        description="STAC dataset the applicant is requesting access to.",
-        examples=["stac://alpine-snow-2024"],
+    dataset_id: str | None = Query(
+        None,
+        description=(
+            "Name of the Network the applicant is requesting scoped access "
+            "to. Optional -- omit for unrestricted access."
+        ),
+        examples=["IDROLOGIA"],
     ),
-    odrl_policy_id: str = Query(
-        ...,
-        description="ODRL policy document governing that dataset.",
-        examples=["odrl:policy:cc-by-nc"],
-    ),
-    requested_role: str = Query(
-        ...,
+    requested_role: str | None = Query(
+        None,
         description=(
             "RBAC role the applicant wants: one of viewer, editor, "
-            "obs_manager, sensor, qc, odrl_governed. A stated preference, "
+            "obs_manager, sensor, qc, custom. A stated preference, "
             "not a grant -- the account is still created as 'pending' "
             "regardless, and an administrator can assign a different "
-            "role at activation."
+            "role at activation. Optional."
         ),
         examples=["viewer"],
     ),
 ):
     client = _client_for(provider)
 
-    try:
-        requested_role = validate_rbac_role(requested_role)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
-        )
+    if requested_role is not None:
+        try:
+            requested_role = validate_rbac_role(requested_role)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+            )
 
     # Stash the selection in the session now -- it has to survive the
     # round trip to the external provider and back, and a GET redirect has
     # no request body to carry it in directly.
     request.session[_SESSION_DATASET_KEY] = dataset_id
-    request.session[_SESSION_POLICY_KEY] = odrl_policy_id
     request.session[_SESSION_ROLE_KEY] = requested_role
 
     redirect_uri = request.url_for("oidc_callback", provider=provider)
@@ -306,23 +300,9 @@ async def oidc_callback(
 
     # Pop rather than get: this session is single-use for this handshake,
     # and popping avoids a stale selection leaking into a second, unrelated
-    # login attempt in the same browser session.
+    # login attempt in the same browser session. Both values are optional.
     dataset_id = request.session.pop(_SESSION_DATASET_KEY, None)
-    odrl_policy_id = request.session.pop(_SESSION_POLICY_KEY, None)
     requested_role = request.session.pop(_SESSION_ROLE_KEY, None)
-    if dataset_id is None or odrl_policy_id is None or requested_role is None:
-        # Only reachable if a client hits /callback directly without going
-        # through /login first, or the session cookie was lost/rejected
-        # mid-flow -- both are caller errors, not server errors.
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                "No dataset/policy/role selection found for this session. "
-                "Start the login at /auth/{provider}/login with "
-                "dataset_id, odrl_policy_id and requested_role, not at "
-                "/callback directly."
-            ),
-        )
 
     try:
         existing = await get_user_by_provider_sub(
@@ -337,7 +317,6 @@ async def oidc_callback(
                     auth_provider=claims["auth_provider"],
                     external_sub_id=claims["external_sub_id"],
                     dataset_id=dataset_id,
-                    odrl_policy_id=odrl_policy_id,
                     requested_role=requested_role,
                 )
             except OidcUsernameCollisionError:

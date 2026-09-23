@@ -18,32 +18,31 @@ Flow
 ----
 1.  Verify caller is an ``administrator`` (HTTP 403 otherwise).
 2.  Within a single DB transaction (write pool):
-    a.  Fetch the target user's username for use in the RLS policy call.
+    a.  Fetch the target user's row.
     b.  UPDATE ``sensorthings."User"`` — set role and status='active'
         WHERE id = target_user_id AND role = 'pending'.
         RETURNING id; if no row returned → HTTP 404 (not found or not pending).
-    c.  Apply the RLS policy function for the assigned role (if one exists).
+    c.  Optionally set ``User.dataset_id`` (a Network name) to scope the user.
     d.  Insert an ADMIN_APPROVAL audit event via ``log_audit_event``.
 3.  Return HTTP 200 with a confirmation payload.
 
 Architecture note
 -----------------
 This endpoint is the "Path B" counterpart to POST /Register.  The
-registration endpoint creates a pending user; this endpoint is the
-administrator action that activates it and binds it to an ODRL policy.
+registration endpoint creates a pending user; this endpoint activates it.
 
-Only ``odrl_governed`` still needs an RLS call here — every other role's
-access is enforced by static policies created once (see
-007_session_scoped_rls_policies.sql), not per-approval.
+No RLS call is made here — capability (what actions) is enforced by the
+static per-role policies created once by 006_session_scoped_rls_policies.sql.
+This endpoint only sets the role and, optionally, the network scope (which
+rows). Both are plain UPDATEs.
 
-The entire mutation (UPDATE + RLS call + AuditLog INSERT) runs inside one
-``conn.transaction()`` block so any failure leaves the user still pending
-with no partial state or silent orphans.
+The entire mutation runs inside one ``conn.transaction()`` block so any
+failure leaves the user still pending with no partial state.
 """
 
 import logging
 
-from app import POSTGRES_PORT_WRITE
+from app import NETWORK, POSTGRES_PORT_WRITE
 from app.db.asyncpg_db import get_pool, get_pool_w
 from app.db.audit_crud import AUDIT_ACTION_ADMIN_APPROVAL, log_audit_event
 from app.models.approval_request import AdminApprovalRequest, ApprovalResponse
@@ -64,7 +63,6 @@ from asyncpg.exceptions import (
     PostgresConnectionError,
     QueryCanceledError,
     TooManyConnectionsError,
-    UndefinedObjectError,
 )
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
@@ -77,27 +75,29 @@ logger = logging.getLogger(__name__)
     "/Users/{target_user_id}/policy-approval",
     methods=["PATCH"],
     tags=["Registration & Approval"],
-    summary="Admin approval: activate a pending user with an ODRL policy",
+    summary="Admin approval: activate a pending user",
     description=(
-        "Promote a pending user to an active role and bind them to the specified "
-        "ODRL dataset policy.  Applies the appropriate Row-Level Security policy "
-        "function for the assigned role and records an ADMIN_APPROVAL audit event. "
-        "Restricted to administrators.  The target user must be in the 'pending' state."
+        "Promote a pending user to an active role, optionally scoping them to "
+        "a Network. The role is a plain UPDATE (RLS is enforced by the static "
+        "policies in 006_session_scoped_rls_policies.sql); dataset_id, if "
+        "given, is written to User.dataset_id and must match an existing "
+        "Network. Records an ADMIN_APPROVAL audit event in the same "
+        "transaction. Restricted to administrators; the target user must be "
+        "in the 'pending' state."
     ),
     status_code=status.HTTP_200_OK,
     responses=merge(
         {
             200: response(
                 ApprovalResponse,
-                "Approved. The RLS policy for the granted role is applied "
-                "and an ADMIN_APPROVAL audit event is recorded, in the "
-                "same transaction as the role change.",
+                "Approved. The role change, the optional network scope, and "
+                "the ADMIN_APPROVAL audit event are all written in one "
+                "transaction.",
                 {
                     "message": "User 'jdoe' (id=42) has been approved with role 'viewer'.",
                     "user_id": 42,
                     "granted_role": "viewer",
-                    "dataset_id": "stac://alpine-snow-2024",
-                    "odrl_policy_id": "odrl:policy:cc-by-nc",
+                    "dataset_id": "IDROLOGIA",
                 },
             )
         },
@@ -152,7 +152,7 @@ async def patch_policy_approval(
                 # ------------------------------------------------------
                 username_row = await conn.fetchrow(
                     """
-                    SELECT username, status, requested_role
+                    SELECT username, status, requested_role, dataset_id
                     FROM sensorthings."User"
                     WHERE id = $1
                     """,
@@ -218,44 +218,39 @@ async def patch_policy_approval(
                     )
 
                 # ------------------------------------------------------
-                # 2c. odrl_governed is the one role that still needs a
-                #     per-approval CREATE POLICY call -- it needs a
-                #     dataset_id to mean anything, and this is the one
-                #     endpoint that has one (request.dataset_id). Builds
-                #     USING (dataset_id = <value>) — see
-                #     005_odrl_dataset_scoping.sql. Deliberately NOT
-                #     migrated to the static-policy scheme below; ODRL
-                #     work is scoped for later.
+                # 2c. Network scope. The role UPDATE above is the entire
+                #     capability grant (enforced by the static policies in
+                #     006_session_scoped_rls_policies.sql). This step only
+                #     sets *which rows* the user may touch, by writing a
+                #     Network name to User.dataset_id.
                 #
-                #     Every other assignable role needs no RLS DDL here at
-                #     all as of 007_session_scoped_rls_policies.sql: their
-                #     policies are static, created once by that migration,
-                #     not per-approval. The UPDATE above is the entire
-                #     grant.
-                #
-                #     IMPORTANT: asyncpg marks the entire transaction as
-                #     aborted if *any* exception occurs inside it, even a
-                #     caught one.  We use a nested savepoint so that an
-                #     UndefinedObjectError rolls back only the inner block
-                #     and leaves the outer transaction (UPDATE + AuditLog)
-                #     in a healthy, committable state.
+                #     request.dataset_id: None  -> leave the applicant's
+                #       requested value unchanged.
+                #                         ""    -> clear any scope.
+                #                         name  -> must match a Network.
                 # ------------------------------------------------------
-                if target_role == "odrl_governed":
-                    policyname = f"{username}_default"
-                    try:
-                        async with conn.transaction():
-                            await conn.execute(
-                                "SELECT sensorthings.odrl_governed_policy($1, $2, $3);",
-                                [username],
-                                policyname,
-                                request.dataset_id,
-                            )
-                    except UndefinedObjectError:
-                        logger.warning(
-                            "RLS policy skipped for '%s': no PostgreSQL role exists "
-                            "(application-layer user from /Register — zero DB footprint).",
-                            username,
+                granted_dataset_id = username_row["dataset_id"]
+                if request.dataset_id is not None:
+                    new_scope = request.dataset_id.strip() or None
+                    if new_scope is not None and NETWORK:
+                        exists = await conn.fetchval(
+                            'SELECT 1 FROM sensorthings."Network" WHERE name = $1',
+                            new_scope,
                         )
+                        if not exists:
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=(
+                                    f"No Network named '{new_scope}'. "
+                                    "dataset_id must match an existing Network."
+                                ),
+                            )
+                    await conn.execute(
+                        'UPDATE sensorthings."User" SET dataset_id = $1 WHERE id = $2',
+                        new_scope,
+                        target_user_id,
+                    )
+                    granted_dataset_id = new_scope
 
                 # ------------------------------------------------------
                 # 2d. Append an ADMIN_APPROVAL record to the AuditLog.
@@ -266,8 +261,7 @@ async def patch_policy_approval(
                     conn=conn,
                     action_type=AUDIT_ACTION_ADMIN_APPROVAL,
                     actor_id=current_user["id"],
-                    dataset_id=request.dataset_id,
-                    odrl_policy_id=request.odrl_policy_id,
+                    dataset_id=granted_dataset_id,
                     payload={
                         "approved_user_id": target_user_id,
                         "granted_role": target_role,
@@ -276,11 +270,11 @@ async def patch_policy_approval(
 
         logger.info(
             "Admin approval: user '%s' (id=%d) granted role '%s' "
-            "for dataset '%s' by admin id=%d.",
+            "scoped to '%s' by admin id=%d.",
             username,
             target_user_id,
             target_role,
-            request.dataset_id,
+            granted_dataset_id,
             current_user["id"],
         )
 
@@ -293,8 +287,7 @@ async def patch_policy_approval(
                 ),
                 "user_id": target_user_id,
                 "granted_role": target_role,
-                "dataset_id": request.dataset_id,
-                "odrl_policy_id": request.odrl_policy_id,
+                "dataset_id": granted_dataset_id,
             },
         )
 

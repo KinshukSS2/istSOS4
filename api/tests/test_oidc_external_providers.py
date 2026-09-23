@@ -334,7 +334,7 @@ def test_login_requires_dataset_id_and_policy_id(app_client):
 def test_login_rejects_unconfigured_provider(app_client):
     r = app_client.get(
         "/istsos4/v1.1/auth/not_a_real_provider/login"
-        "?dataset_id=ds://x&odrl_policy_id=odrl://y&requested_role=viewer",
+        "?dataset_id=ds://x&requested_role=viewer",
         follow_redirects=False,
     )
     assert r.status_code == 404
@@ -344,7 +344,7 @@ def test_login_rejects_unconfigured_provider(app_client):
 def test_login_redirects_and_stores_selection_in_session(app_client):
     r = app_client.get(
         "/istsos4/v1.1/auth/testoidc/login"
-        "?dataset_id=ds://climate&odrl_policy_id=odrl://supsi&requested_role=viewer",
+        "?dataset_id=ds://climate&requested_role=viewer",
         follow_redirects=False,
     )
     assert r.status_code == 302
@@ -393,7 +393,7 @@ def test_callback_new_identity_creates_pending_user_and_returns_202(app_client):
     ):
         app_client.get(
             "/istsos4/v1.1/auth/testoidc/login"
-            "?dataset_id=ds://climate&odrl_policy_id=odrl://supsi&requested_role=viewer",
+            "?dataset_id=ds://climate&requested_role=viewer",
             follow_redirects=False,
         )
 
@@ -409,7 +409,6 @@ def test_callback_new_identity_creates_pending_user_and_returns_202(app_client):
                 "auth_provider": "testoidc",
                 "external_sub_id": "new-sub-1",
                 "dataset_id": "ds://climate",
-                "odrl_policy_id": "odrl://supsi",
             },
         )
         with patch.object(
@@ -446,7 +445,6 @@ def test_callback_existing_pending_identity_returns_202(app_client):
         "auth_provider": "testoidc",
         "external_sub_id": "existing-sub-1",
         "dataset_id": "ds://climate",
-        "odrl_policy_id": "odrl://supsi",
     }
 
     with patch.object(
@@ -454,7 +452,7 @@ def test_callback_existing_pending_identity_returns_202(app_client):
     ):
         app_client.get(
             "/istsos4/v1.1/auth/testoidc/login"
-            "?dataset_id=ds://climate&odrl_policy_id=odrl://supsi&requested_role=viewer",
+            "?dataset_id=ds://climate&requested_role=viewer",
             follow_redirects=False,
         )
 
@@ -491,7 +489,6 @@ def test_callback_existing_approved_identity_issues_access_token(app_client):
         "auth_provider": "testoidc",
         "external_sub_id": "approved-sub-1",
         "dataset_id": "ds://climate",
-        "odrl_policy_id": "odrl://supsi",
     }
 
     with patch.object(
@@ -499,7 +496,7 @@ def test_callback_existing_approved_identity_issues_access_token(app_client):
     ):
         app_client.get(
             "/istsos4/v1.1/auth/testoidc/login"
-            "?dataset_id=ds://climate&odrl_policy_id=odrl://supsi&requested_role=viewer",
+            "?dataset_id=ds://climate&requested_role=viewer",
             follow_redirects=False,
         )
 
@@ -564,7 +561,6 @@ def test_callback_username_collision_auto_resolves_with_suffix(app_client):
                 "auth_provider": "testoidc",
                 "external_sub_id": "collide-sub-1",
                 "dataset_id": "ds://climate",
-                "odrl_policy_id": "odrl://supsi",
             },
         ]
     )
@@ -581,7 +577,7 @@ def test_callback_username_collision_auto_resolves_with_suffix(app_client):
     ):
         app_client.get(
             "/istsos4/v1.1/auth/testoidc/login"
-            "?dataset_id=ds://climate&odrl_policy_id=odrl://supsi&requested_role=viewer",
+            "?dataset_id=ds://climate&requested_role=viewer",
             follow_redirects=False,
         )
 
@@ -645,7 +641,7 @@ def test_callback_username_collision_returns_409_when_every_fallback_collides(
     ):
         app_client.get(
             "/istsos4/v1.1/auth/testoidc/login"
-            "?dataset_id=ds://climate&odrl_policy_id=odrl://supsi&requested_role=viewer",
+            "?dataset_id=ds://climate&requested_role=viewer",
             follow_redirects=False,
         )
 
@@ -680,7 +676,7 @@ def test_callback_github_uses_rest_api_not_id_token(app_client):
     ):
         app_client.get(
             "/istsos4/v1.1/auth/github/login"
-            "?dataset_id=ds://climate&odrl_policy_id=odrl://supsi&requested_role=viewer",
+            "?dataset_id=ds://climate&requested_role=viewer",
             follow_redirects=False,
         )
 
@@ -694,7 +690,6 @@ def test_callback_github_uses_rest_api_not_id_token(app_client):
                 "auth_provider": "github",
                 "external_sub_id": "555",
                 "dataset_id": "ds://climate",
-                "odrl_policy_id": "odrl://supsi",
             },
         )
         with patch.object(

@@ -92,15 +92,14 @@ async def get_user_by_provider_sub(
     """Look up an existing user by their external-provider subject identifier.
 
     Returns a dict with ``{id, username, role, uri, auth_provider,
-    external_sub_id, dataset_id, odrl_policy_id}`` or ``None`` if no match
-    is found.
+    external_sub_id, dataset_id}`` or ``None`` if no match is found.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             SELECT id, username, role, uri, auth_provider, external_sub_id,
-                dataset_id, odrl_policy_id
+                dataset_id
             FROM sensorthings."User"
             WHERE auth_provider = $1
               AND external_sub_id = $2
@@ -119,7 +118,6 @@ async def create_pending_oidc_user(
     auth_provider: str,
     external_sub_id: str,
     dataset_id: str | None = None,
-    odrl_policy_id: str | None = None,
     requested_role: str | None = None,
 ) -> dict:
     """Insert a new OIDC-linked user in the 'pending' waiting room.
@@ -144,27 +142,23 @@ async def create_pending_oidc_user(
                          ``"orcid"``, ``"keycloak"``.
         external_sub_id: The ``sub`` claim from the provider's JWT — globally
                          unique within that provider's namespace.
-        dataset_id:      Dataset the user selected before starting the OIDC
-                         handshake (see app.v1.endpoints.create.oidc_login),
-                         mirroring what POST /Register already collects for
-                         local accounts. May be ``None`` if the caller never
-                         collected one.
-        odrl_policy_id:  ODRL policy identifier tied to that dataset
-                         selection. Same nullability as dataset_id.
+        dataset_id:      Name of the Network the user requested scoped access
+                         to before starting the OIDC handshake (see
+                         app.v1.endpoints.create.oidc_login), mirroring what
+                         POST /Register collects for local accounts. May be
+                         ``None``.
         requested_role:  RBAC role the user asked to be granted, collected
-                         the same way as dataset_id/odrl_policy_id (see
-                         oidc_login.py). An administrator reviewing the
-                         pending queue sees this as the default at
-                         activation time but can assign a different role —
-                         see activate_user.py. Same nullability as
-                         dataset_id.
+                         the same way as dataset_id (see oidc_login.py). An
+                         administrator reviewing the pending queue sees this
+                         as the default at activation time but can assign a
+                         different role — see activate_user.py.
 
     Returns:
         dict with keys ``id``, ``username``, ``role``, ``uri``,
-        ``auth_provider``, ``external_sub_id``, ``dataset_id``,
-        ``odrl_policy_id``. ``username`` reflects whichever candidate
-        actually got inserted — the caller's ``username`` argument if it
-        was free, or an auto-suffixed variant otherwise (see
+        ``auth_provider``, ``external_sub_id``, ``dataset_id``.
+        ``username`` reflects whichever candidate actually got inserted —
+        the caller's ``username`` argument if it was free, or an
+        auto-suffixed variant otherwise (see
         _suffixed_candidate()).
 
     Raises:
@@ -190,7 +184,7 @@ async def create_pending_oidc_user(
         # administrator sees on the pending queue (GET /Users) alongside
         # the "id" column already returned there, letting a human make
         # the "is this the same person" call rather than the system
-        # guessing. See 009_oidc_duplicate_hint.sql.
+        # guessing. See 008_oidc_duplicate_hint.sql.
         possible_duplicate_of = None
         if email:
             dup_row = await conn.fetchrow(
@@ -226,13 +220,13 @@ async def create_pending_oidc_user(
                     row = await conn.fetchrow(
                         """
                         INSERT INTO sensorthings."User"
-                            (username, contact, role, auth_provider,
-                             external_sub_id, dataset_id, odrl_policy_id,
+                            (username, contact, role, status, auth_provider,
+                             external_sub_id, dataset_id,
                              requested_role, possible_duplicate_of)
                         VALUES
-                            ($1, $2::jsonb, $3, $4, $5, $6, $7, $8, $9)
+                            ($1, $2::jsonb, $3, 'pending', $4, $5, $6, $7, $8)
                         RETURNING id, username, role, uri, auth_provider,
-                            external_sub_id, dataset_id, odrl_policy_id;
+                            external_sub_id, dataset_id;
                         """,
                         candidate,
                         contact,
@@ -240,9 +234,30 @@ async def create_pending_oidc_user(
                         auth_provider,
                         external_sub_id,
                         dataset_id,
-                        odrl_policy_id,
                         requested_role,
                         possible_duplicate_of,
+                    )
+
+                    # Backfill uri now that the serial id exists -- the same
+                    # second step create/register_request.py does, and it
+                    # cannot be folded into the INSERT above because the
+                    # value depends on the id that INSERT is assigning.
+                    #
+                    # Not cosmetic: set_commit() (update/functions.py) writes
+                    # Commit.author = current_user["uri"], and Commit.author
+                    # is NOT NULL. Leaving uri NULL made every write by an
+                    # externally-authenticated user fail on that constraint,
+                    # surfacing as a misleading 400 "Invalid entity: a
+                    # required value is missing or not allowed."
+                    row = dict(row)
+                    row["uri"] = await conn.fetchval(
+                        """
+                        UPDATE sensorthings."User"
+                        SET uri = '/Users(' || id || ')'
+                        WHERE id = $1
+                        RETURNING uri;
+                        """,
+                        row["id"],
                     )
 
                     # Lazy import: audit_crud has no reverse dependency on
@@ -258,7 +273,6 @@ async def create_pending_oidc_user(
                         action_type=AUDIT_ACTION_RESTRICTED_REQUEST,
                         actor_id=row["id"],
                         dataset_id=dataset_id,
-                        odrl_policy_id=odrl_policy_id,
                         payload={
                             "auth_provider": auth_provider,
                             "requested_role": requested_role,

@@ -36,7 +36,7 @@ mutation: an UPDATE on the role column plus an RLS policy call.  No
 
 import logging
 
-from app import POSTGRES_PORT_WRITE
+from app import NETWORK, POSTGRES_PORT_WRITE
 from app.db.asyncpg_db import get_pool, get_pool_w
 from app.db.audit_crud import AUDIT_ACTION_ADMIN_APPROVAL, log_audit_event
 from app.models.error import MessageError
@@ -56,7 +56,6 @@ from asyncpg.exceptions import (
     PostgresConnectionError,
     QueryCanceledError,
     TooManyConnectionsError,
-    UndefinedObjectError,
 )
 from fastapi import APIRouter, Body, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
@@ -65,10 +64,13 @@ v1 = APIRouter()
 logger = logging.getLogger(__name__)
 
 ACTIVATE_PAYLOAD_EXAMPLE = {
-    # one of: viewer, editor, obs_manager, sensor, qc, odrl_governed.
-    # Omit entirely to activate with whatever role the applicant requested
-    # at /auth/{provider}/login.
+    # role: one of viewer, editor, obs_manager, sensor, qc, custom.
+    #   Omit to use whatever the applicant requested at
+    #   /auth/{provider}/login.
+    # dataset: optional Network name to scope the user to. Omit to keep the
+    #   applicant's requested value; "" to clear any scope.
     "role": "viewer",
+    "dataset": "IDROLOGIA",
 }
 
 
@@ -92,22 +94,17 @@ ACTIVATE_PAYLOAD_EXAMPLE = {
                 "Activated with the requested role.",
                 {"message": "User 'jdoe' has been activated with role 'viewer'."},
             ),
-            # Three distinct causes share 400: an unrecognised role string,
+            # Two distinct causes share 400: an unrecognised role string, or
             # a rejected applicant (role stays 'pending' by design, so the
-            # pending/404 checks alone wouldn't catch this), or
-            # 'odrl_governed' requested with no dataset_id on file.
+            # pending/404 checks alone wouldn't catch this).
             400: response(
                 MessageError,
-                "One of: the requested role isn't one of the assignable "
-                "roles; the user's registration was rejected and must be "
-                "re-applied via POST /Register instead; or 'odrl_governed' "
-                "was requested but this user has no dataset_id on file "
-                "(only set via GET /auth/{provider}/login).",
+                "Either the requested role isn't one of the assignable "
+                "roles, or the user's registration was rejected and must "
+                "be re-applied via POST /Register instead.",
                 {
-                    "message": "User 'jdoe' has no dataset_id on file, so "
-                    "they cannot be activated into 'odrl_governed'. They "
-                    "must restart login via /auth/{provider}/login with a "
-                    "dataset_id and odrl_policy_id selected."
+                    "message": "Role 'foo' is not one of the assignable "
+                    "roles."
                 },
             ),
         },
@@ -157,7 +154,7 @@ async def activate_user(
             user_row = await conn.fetchrow(
                 """
                 SELECT id, username, role, status, dataset_id, requested_role,
-                    odrl_policy_id, auth_provider
+                    auth_provider
                 FROM sensorthings."User"
                 WHERE id = $1
                 """,
@@ -225,24 +222,6 @@ async def activate_user(
                     content={"message": str(exc)},
                 )
 
-            if target_role == "odrl_governed" and user_row["dataset_id"] is None:
-                # This user never went through /auth/{provider}/login with
-                # a dataset_id/odrl_policy_id selection (see oidc_login.py)
-                # -- 'odrl_governed' has nothing to scope the RLS predicate
-                # to, so approving into it would be a silent no-op policy
-                # exactly like the old 'custom' role used to be.
-                return JSONResponse(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    content={
-                        "message": (
-                            f"User '{username}' has no dataset_id on file, "
-                            "so they cannot be activated into 'odrl_governed'. "
-                            "They must restart login via /auth/{provider}/login "
-                            "with a dataset_id and odrl_policy_id selected."
-                        )
-                    },
-                )
-
             # ----------------------------------------------------------
             # 4. All mutations inside a single transaction so any
             #    failure leaves the user still 'pending' (no half-state).
@@ -251,55 +230,51 @@ async def activate_user(
 
                 # 4a. Promote the application-layer role in the User table.
                 #     Pure parameterised UPDATE — no DDL.
+                #
+                #     No per-activation RLS call: every assignable role's
+                #     access is enforced by the static policies created
+                #     once by 006_session_scoped_rls_policies.sql, keyed on
+                #     the app.current_user_id session claim. A 'custom'
+                #     user gets standard group access; any narrower rule is
+                #     added later via POST /Policies.
                 await conn.execute(
                     """
                     UPDATE sensorthings."User"
-                    SET role = $1
+                    SET role   = $1,
+                        status = 'active'
                     WHERE id  = $2
                     """,
                     target_role,
                     user_id,
                 )
 
-                # 4b. odrl_governed is the one role that still needs a
-                #     per-activation CREATE POLICY call — it needs a
-                #     dataset_id to mean anything, and an OIDC-provisioned
-                #     user can actually have one now (collected at
-                #     /auth/{provider}/login, see oidc_login.py), read
-                #     straight off user_row. Mirrors
-                #     update/admin_approval.py's dispatch. Deliberately NOT
-                #     migrated to the static-policy scheme; ODRL work is
-                #     scoped for later.
-                #
-                #     Every other role needs no RLS DDL here at all as of
-                #     007_session_scoped_rls_policies.sql — their policies
-                #     are static, created once by that migration, not
-                #     per-activation. The role UPDATE above is the entire
-                #     grant.
-                #
-                #     IMPORTANT: asyncpg marks the entire transaction as
-                #     aborted on any caught exception inside it, so a
-                #     nested savepoint isolates UndefinedObjectError —
-                #     the outer transaction (role UPDATE) still commits.
-                #     Mirrors the identical pattern in
-                #     update/admin_approval.py.
-                if target_role == "odrl_governed":
-                    policyname = f"{username}_default"
-                    try:
-                        async with conn.transaction():
-                            await conn.execute(
-                                "SELECT sensorthings.odrl_governed_policy($1, $2, $3);",
-                                [username],
-                                policyname,
-                                user_row["dataset_id"],
-                            )
-                    except UndefinedObjectError:
-                        logger.warning(
-                            "RLS policy skipped for '%s': no PostgreSQL role "
-                            "exists (application-layer user from /Register "
-                            "— zero DB footprint).",
-                            username,
+                # 4b. Optional network scope. `dataset` in the body
+                #     overrides what the applicant requested at login;
+                #     "" clears it, absent leaves it unchanged. Must match
+                #     an existing Network.
+                granted_dataset_id = user_row["dataset_id"]
+                dataset_raw = payload.get("dataset")
+                if dataset_raw is not None:
+                    new_scope = str(dataset_raw).strip() or None
+                    if new_scope is not None and NETWORK:
+                        exists = await conn.fetchval(
+                            'SELECT 1 FROM sensorthings."Network" WHERE name = $1',
+                            new_scope,
                         )
+                        if not exists:
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=(
+                                    f"No Network named '{new_scope}'. "
+                                    "dataset must match an existing Network."
+                                ),
+                            )
+                    await conn.execute(
+                        'UPDATE sensorthings."User" SET dataset_id = $1 WHERE id = $2',
+                        new_scope,
+                        user_id,
+                    )
+                    granted_dataset_id = new_scope
 
                 # 4c. Record the activation in the AuditLog — same
                 #     transaction as the role UPDATE above, so a logging
@@ -314,8 +289,7 @@ async def activate_user(
                     conn=conn,
                     action_type=AUDIT_ACTION_ADMIN_APPROVAL,
                     actor_id=current_user["id"],
-                    dataset_id=user_row["dataset_id"],
-                    odrl_policy_id=user_row["odrl_policy_id"],
+                    dataset_id=granted_dataset_id,
                     payload={
                         "activated_user_id": user_id,
                         "activated_username": username,
@@ -341,6 +315,10 @@ async def activate_user(
             },
         )
 
+    except HTTPException:
+        # Deliberate 4xx raised inside the transaction (e.g. unknown
+        # Network) — let it through rather than masking it as a 500.
+        raise
     except InsufficientPrivilegeError:
         return JSONResponse(
             status_code=status.HTTP_403_FORBIDDEN,

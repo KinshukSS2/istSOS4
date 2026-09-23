@@ -276,14 +276,10 @@ BAD_REQUEST_REJECTED = {
 BAD_REQUEST_OIDC_CALLBACK = {
     400: response(
         DetailError,
-        "Two distinct causes share this code: the provider rejected or the "
-        "user cancelled the consent screen (token exchange failed), or "
-        "`/callback` was hit directly without a prior `/login` call, so no "
-        "dataset/policy selection exists in the session.",
+        "The provider rejected or the user cancelled the consent screen "
+        "(token exchange failed).",
         {
-            "detail": "No dataset/policy selection found for this session. "
-            "Start the login at /auth/{provider}/login with dataset_id and "
-            "odrl_policy_id, not at /callback directly."
+            "detail": "Authorization failed at the identity provider."
         },
     )
 }

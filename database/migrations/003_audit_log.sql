@@ -59,7 +59,6 @@ BEGIN
                                               'ADMIN_APPROVAL'
                                           )),
             "dataset_id"     TEXT,
-            "odrl_policy_id" TEXT,
             "payload"        JSONB        DEFAULT NULL,
             "created_at"     TIMESTAMPTZ  NOT NULL DEFAULT NOW()
         );

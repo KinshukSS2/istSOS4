@@ -32,3 +32,10 @@ test_dataset_scoping.py
 test_security_boundaries.py
 
 SWAGGER_TESTING_GUIDE.md
+
+CODEBASE_DIVERGENCE_REPORT.md
+GSOC_PROJECT_CONTEXT.md
+SESSION_HANDOFF.md
+GSOC_FINAL_REPORT.html
+api/tests/e2e/DEMO.md
+api/tests/e2e/EXTERNAL_AUTH_DEMO.md

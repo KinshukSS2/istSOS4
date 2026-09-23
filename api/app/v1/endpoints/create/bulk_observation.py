@@ -32,8 +32,6 @@ user = Header(default=None, include_in_schema=False)
 message = Header(default=None, alias="commit-message", include_in_schema=False)
 
 if AUTHORIZATION:
-    from app.oauth import get_current_user
-
     user = Depends(get_current_user)
 
 if VERSIONING or AUTHORIZATION:

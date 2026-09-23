@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Regression coverage for 007_session_scoped_rls_policies.sql.
+"""Regression coverage for 006_session_scoped_rls_policies.sql.
 
 Every other RLS-adjacent test in this suite mocks the database connection
 entirely, so none of them can actually prove row-level security enforces
@@ -219,7 +219,7 @@ def test_datastream_rls_filters_by_dataset_id_per_user():
                     f"{ds_a} -- got {visible_ids}. Two users sharing the "
                     "same PostgreSQL group role ('user') seeing each "
                     "other's rows is exactly the bug "
-                    "007_session_scoped_rls_policies.sql fixed."
+                    "006_session_scoped_rls_policies.sql fixed."
                 )
             finally:
                 await transaction.rollback()
@@ -256,10 +256,10 @@ def test_static_policies_are_group_scoped_not_per_user():
 
         # The complete, real set of PostgreSQL group roles this schema
         # defines (confirmed against pg_roles) that could legitimately
-        # back an RLS policy. "odrl_governed" is deliberately absent --
-        # it is an application-layer role name only; DB_ROLE_BY_RBAC_ROLE
-        # maps it onto the shared "user" PG role, it has no PG role of
-        # its own (see rbac_roles.py).
+        # back an RLS policy. Application-layer role names like "custom"
+        # are deliberately absent -- DB_ROLE_BY_RBAC_ROLE maps them onto a
+        # shared PG group role, they have no PG role of their own
+        # (see rbac_roles.py).
         known_group_roles = {"user", "sensor", "qc", "administrator", "guest", "public"}
         for row in rows:
             for role_name in row["role_names"]:
@@ -268,7 +268,7 @@ def test_static_policies_are_group_scoped_not_per_user():
                     "which is not one of the known shared group roles -- "
                     "this looks like a per-username policy, the exact "
                     "pattern that never matched a real session before "
-                    "007_session_scoped_rls_policies.sql."
+                    "006_session_scoped_rls_policies.sql."
                 )
 
     asyncio.run(_run())

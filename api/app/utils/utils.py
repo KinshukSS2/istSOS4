@@ -467,9 +467,9 @@ def build_expand(expand_node):
         # Handle $count
         if e.subquery and e.subquery.count:
             if e.subquery.count is True:
-                subparts.append(f"$count=true")
+                subparts.append("$count=true")
             else:
-                subparts.append(f"$count=false")
+                subparts.append("$count=false")
 
         # Handle nested $expand (recursive call)
         if e.subquery and e.subquery.expand:

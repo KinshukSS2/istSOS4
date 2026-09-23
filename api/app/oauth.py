@@ -47,9 +47,10 @@ logger = logging.getLogger(__name__)
 _TOKEN_URL = f"{SUBPATH}{VERSION}/Login"
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl=_TOKEN_URL)
-# Optional variant: auto_error=False means FastAPI will NOT raise 401 when the
-# Authorization header is absent.  The token parameter will be None instead,
-# allowing get_optional_current_user to return None gracefully.
+# auto_error=False: FastAPI does not raise 401 when the Authorization header
+# is absent. Used by /Refresh and /Logout (see create/login.py) so Swagger's
+# padlock covers those routes without forcing a 401 before the handler's own
+# token parsing runs.
 oauth2_scheme_optional = OAuth2PasswordBearer(
     tokenUrl=_TOKEN_URL, auto_error=False
 )
@@ -363,82 +364,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
             status_code=status.HTTP_403_FORBIDDEN,
             detail="This account has been deactivated",
         )
-
-    return user
-
-
-async def get_optional_current_user(
-    token: str | None = Depends(oauth2_scheme_optional),
-):
-    """Attempt to decode the Bearer JWT and return the user dict.
-
-    Unlike ``get_current_user`` this dependency NEVER raises an HTTP 401/403.
-    Instead it returns ``None`` for any of the following conditions:
-
-    * No ``Authorization`` header present (unauthenticated public request).
-    * Token is malformed or has an invalid signature.
-    * Token has expired (``jwt.ExpiredSignatureError``).
-    * Token has been revoked (present in the Redis blocklist).
-    * The ``sub`` claim does not map to any row in ``sensorthings."User"``.
-    * The user account exists but is in the ``pending`` waiting room.
-    * The user account has been deactivated (DELETE /Users).
-
-    Callers (read endpoints, asyncpg_stream_results) treat ``None`` as the
-    signal to fall back to the ``guest`` PostgreSQL role, which activates the
-    is_public RLS policy on Datastream / Observation.
-
-    Args:
-        token: Bearer token extracted by FastAPI from the Authorization header,
-               or ``None`` if the header is absent (auto_error=False).
-
-    Returns:
-        Authenticated user dict on success, ``None`` otherwise.
-    """
-    if token is None:
-        return None
-
-    try:
-        # Honour the Redis revocation blocklist first.
-        if REDIS and redis.get(token) is not None:
-            logger.debug(
-                "get_optional_current_user: token is revoked — treating as anonymous."
-            )
-            return None
-
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if not username:
-            return None
-    except InvalidTokenError:
-        # Covers ExpiredSignatureError, DecodeError, InvalidSignatureError, etc.
-        logger.debug(
-            "get_optional_current_user: invalid/expired token — treating as anonymous."
-        )
-        return None
-
-    # NOTE: role is fetched live from the DB (same rationale as get_current_user).
-    user = await get_user_from_db(username)
-    if user is None:
-        return None
-
-    # Pending users have no DB role yet — deny silently so they cannot sneak
-    # through as guests (they'd receive the guest RLS view, not their own data).
-    if user["role"] == PENDING_ROLE:
-        logger.debug(
-            "get_optional_current_user: pending user %r — treating as anonymous.",
-            username,
-        )
-        return None
-
-    # Same silent-anonymous treatment as pending -- a deactivated user must
-    # not sneak through as guest either (they'd get the guest RLS view
-    # instead of correctly being denied their own data).
-    if user["status"] == DELETED_STATUS:
-        logger.debug(
-            "get_optional_current_user: deactivated user %r — treating as anonymous.",
-            username,
-        )
-        return None
 
     return user
 

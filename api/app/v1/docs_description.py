@@ -16,10 +16,10 @@
 
 Kept out of api.py so a ~100-line markdown block doesn't bury the router
 wiring. This is also the ONLY place several GSoC deliverables can be
-represented in Swagger at all -- the append-only AuditLog, the row-level
-security policies, and the public-access read behavior are a table, a set
-of stored Postgres functions, and a WHERE clause, not endpoints. There is
-no operation to attach a summary/description to for any of them.
+represented in Swagger at all -- the append-only AuditLog and the row-level
+security policies are a table and a set of stored Postgres functions, not
+endpoints. There is no operation to attach a summary/description to for
+any of them.
 """
 
 V1_DESCRIPTION = """
@@ -39,9 +39,10 @@ row-level security, the audit trail — actually live.*
    posts to `POST /Login` and stores the bearer token for you.
 2. Every operation with a padlock icon then sends
    `Authorization: Bearer <token>` automatically when you run **Try it out**.
-3. No token isn't rejected outright — an anonymous request runs as the
-   PostgreSQL `guest` role and sees only rows a row-level-security policy
-   has marked public.
+3. Anonymous read access depends on deployment config. With
+   `ANONYMOUS_VIEWER=0` (the default) a request with no token is rejected
+   with 401. With `ANONYMOUS_VIEWER=1` an anonymous request runs as the
+   PostgreSQL `guest` role for reads.
 
 ---
 
@@ -51,7 +52,7 @@ Access is staged, not binary. No path skips a stage.
 
 | State | How you get there | What you can do |
 |:--|:--|:--|
-| **guest** | no token at all | read rows where `is_public` is true |
+| **guest** | no token at all, and only when `ANONYMOUS_VIEWER=1` | read-only, subject to the `guest` row-level-security policy |
 | **pending** | `POST /Register`, or a first-time login via `GET /auth/{provider}/login` | nothing — every authenticated route returns 403 |
 | **approved** | an administrator calls `PATCH /Users/{id}/policy-approval` | whatever the granted RBAC role and row-level-security policy allow |
 | **rejected** | an administrator calls `PATCH /Users/{id}/reject` | nothing, permanently, unless the applicant re-registers |
@@ -64,7 +65,7 @@ itself. An administrator always makes the decision.
 
 ### RBAC roles
 
-Assignable: `viewer` &nbsp;·&nbsp; `editor` &nbsp;·&nbsp; `obs_manager` &nbsp;·&nbsp; `sensor` &nbsp;·&nbsp; `qc` &nbsp;·&nbsp; `odrl_governed`
+Assignable: `viewer` &nbsp;·&nbsp; `editor` &nbsp;·&nbsp; `obs_manager` &nbsp;·&nbsp; `sensor` &nbsp;·&nbsp; `qc` &nbsp;·&nbsp; `custom`
 
 `administrator` is deliberately **not** assignable through this API at
 all — promotion to admin is infrastructure/DBA-only, and the last
@@ -76,16 +77,16 @@ directly by a caller.
 
 ### Row-level security
 
-Each role maps to a stored PostgreSQL policy function — `viewer_policy`,
-`editor_policy`, `obs_manager_policy`, `sensor_policy`, `qc_policy`.
-Enforcement happens **inside the database**, not in this application's
-Python code: the API switches the session's active role with
-`SET LOCAL ROLE` per request, and PostgreSQL's own row-level security does
-the filtering.
+istSOS users are not PostgreSQL roles. The backend connects as one service
+account; per request it runs `SET LOCAL ROLE <group>` (`user` / `sensor` /
+`qc`) and stamps `app.current_user_id`. PostgreSQL row-level security then
+filters using the static per-role policies created once by
+`006_session_scoped_rls_policies.sql` — enforcement happens **inside the
+database**, not in Python.
 
-`odrl_governed` is the one role with a genuinely per-dataset predicate
-(`dataset_id = ...`) rather than a blanket grant, built for dataset-scoped
-access requests and applied directly by `PATCH /Users/{id}/policy-approval`.
+`custom` maps to the `user` group and gets the standard read access. A
+narrower, hand-written rule for a specific user is added separately via
+`POST /Policies` with `permissions.type = "custom"`.
 
 ---
 
@@ -97,7 +98,7 @@ database level — `UPDATE`/`DELETE` are revoked from every role, including
 the action it records, so an action and its audit row commit or roll back
 together.
 
-Recorded action types: `PUBLIC_READ` &nbsp;·&nbsp; `RESTRICTED_REQUEST` &nbsp;·&nbsp; `ADMIN_APPROVAL` &nbsp;·&nbsp; `ADMIN_REJECTION`
+Recorded action types: `RESTRICTED_REQUEST` &nbsp;·&nbsp; `ADMIN_APPROVAL` &nbsp;·&nbsp; `ADMIN_REJECTION`
 
 ---
 

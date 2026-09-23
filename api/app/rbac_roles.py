@@ -9,23 +9,30 @@ VALID_RBAC_ROLES = {
     "obs_manager",
     "sensor",
     "qc",
-    "odrl_governed",
+    "custom",
 }
 
-# Internal sentinel for OIDC users awaiting admin activation.
+# Internal sentinel role for a user awaiting admin approval / activation.
 # Users in this state have NO PostgreSQL database role (zero DB footprint).
 PENDING_ROLE = "pending"
 
-# sensorthings."User".status value for a deactivated account (see
-# delete/user.py). DELETE /Users never hard-deletes the row: an
-# AuditLog_actor_id_fkey ON DELETE SET NULL trigger runs with the
-# referenced table's owner privileges, not the caller's, and that owner
-# (administrator) was deliberately never granted UPDATE on AuditLog, since
-# it's meant to be genuinely append-only -- so a real DELETE fails for
-# every caller, unconditionally. Deactivating in place sidesteps that
-# entirely: it's a plain UPDATE, and the row (and every AuditLog entry
-# that references it) is left alone. 'active' and 'rejected' are the
-# other values this same unconstrained VARCHAR(50) column already used.
+# ---------------------------------------------------------------------------
+# sensorthings."User".status -- account lifecycle, an unconstrained
+# VARCHAR(50). One of:
+#   'pending'  -- registered (POST /Register or OIDC), awaiting an admin
+#                 decision; not usable. Set alongside role='pending'.
+#   'active'   -- approved, or created directly by an admin; usable.
+#   'rejected' -- admin denied the request (role stays 'pending').
+#   'deleted'  -- soft-deleted by DELETE /Users. A real DELETE is
+#                 impossible: the AuditLog_actor_id_fkey ON DELETE SET NULL
+#                 action runs as the AuditLog owner ('administrator'), which
+#                 has no UPDATE on the append-only AuditLog, so it always
+#                 fails. Deactivating in place is a plain UPDATE that leaves
+#                 the row and its audit entries untouched.
+# ---------------------------------------------------------------------------
+PENDING_STATUS = "pending"
+ACTIVE_STATUS = "active"
+REJECTED_STATUS = "rejected"
 DELETED_STATUS = "deleted"
 
 # Maps each assignable RBAC role to its underlying PostgreSQL group role.
@@ -36,31 +43,24 @@ DB_ROLE_BY_RBAC_ROLE = {
     "obs_manager": "sensor",
     "sensor": "sensor",
     "qc": "qc",
-    "odrl_governed": "user",
+    "custom": "user",
 }
 
 # ---------------------------------------------------------------------------
-# HISTORICAL NOTE: viewer/editor/obs_manager/sensor/qc used to each need a
-# CREATE POLICY call at approval time, dispatched through this map to a
-# stored function (viewer_policy(), editor_policy(), ...). Those functions
-# and that map are gone as of 007_session_scoped_rls_policies.sql: the
-# per-approval policies they created were scoped ``TO <username>``, but no
-# application code path has ever created an individual PostgreSQL login
-# role for a real user, so those policies could never match any real
-# session for any user, ever. Access control for these five roles is now
-# enforced by static policies created once by that migration, scoped to
-# the shared group role (see DB_ROLE_BY_RBAC_ROLE) plus a session claim
-# (app.current_user_id, set by set_role() in v1/endpoints/functions.py) —
-# approving or activating a user into one of these roles is now a plain
-# UPDATE, nothing else.
+# NOTE: viewer/editor/obs_manager/sensor/qc used to each need a CREATE POLICY
+# call at approval time, dispatched to a stored function (viewer_policy(),
+# editor_policy(), ...). Those per-user functions are dropped by
+# 006_session_scoped_rls_policies.sql because istSOS users are not
+# PostgreSQL roles, so a policy scoped ``TO <username>`` can never match a
+# session that runs as a shared group role. Access for these roles is now
+# enforced by static policies created once by that migration, scoped to the
+# group role plus the app.current_user_id session claim set by set_role().
+# Approving or activating a user into any assignable role is now a plain
+# UPDATE of "User".role.
 #
-# odrl_governed is the one role NOT covered by that migration — deferred
-# for future ODRL work, per explicit scope decision. It still needs a
-# dataset_id to mean anything, and update/admin_approval.py still calls
-# sensorthings.odrl_governed_policy() directly, per-approval, exactly as
-# before. create/user.py and activate_user.py still correctly skip policy
-# creation for it entirely (it needs a dataset_id neither of those flows
-# collects).
+# 'custom' maps to the "user" group role. A custom user gets the standard
+# viewer/editor read access from the static policies; any narrower,
+# hand-specified rule is added separately via POST /Policies.
 # ---------------------------------------------------------------------------
 
 

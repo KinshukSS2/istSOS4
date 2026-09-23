@@ -15,7 +15,6 @@ if API_DIR not in sys.path:
 os.environ.setdefault("SECRET_KEY", "test_secret_key")
 
 import app.v1.endpoints.create.policy as create_policy_endpoint  # noqa: E402
-import app.v1.endpoints.update.policy as update_policy_endpoint  # noqa: E402
 
 
 def mock_pgpool(connection):
@@ -38,12 +37,12 @@ def attach_transaction_cm(connection):
     connection.transaction = tx
 
 
-def test_create_policy_rejects_role_types_covered_by_static_policies():
+def test_create_policy_noops_for_role_types_covered_by_static_policies():
     """viewer/editor/obs_manager/sensor/qc get RLS access automatically from
-    007_session_scoped_rls_policies.sql's static policies the moment their
-    role is set. That migration DROPs viewer_policy()/.../qc_policy() --
-    calling this endpoint with one of those types used to raise a raw
-    Postgres UndefinedFunctionError; it should now be rejected up front.
+    006_session_scoped_rls_policies.sql's static policies the moment their
+    role is set. That migration DROPs viewer_policy()/.../qc_policy(), so the
+    endpoint accepts these types for API compatibility but creates nothing
+    and returns 200.
     """
     connection = AsyncMock()
     connection.execute = AsyncMock()
@@ -69,30 +68,9 @@ def test_create_policy_rejects_role_types_covered_by_static_policies():
     assert any('SET LOCAL ROLE "administrator";' in sql for sql in sql_calls)
     assert not any("RESET ROLE" in sql for sql in sql_calls)
     assert not any("_policy(" in sql for sql in sql_calls)
-    assert response.status_code == 400
-
-
-def test_update_policy_sets_and_resets_role_for_admin():
-    connection = AsyncMock()
-    connection.execute = AsyncMock()
-    connection.fetchrow = AsyncMock(
-        return_value={"tablename": "Datastream", "cmd": "SELECT"}
-    )
-    attach_transaction_cm(connection)
-
-    payload = {"policy": "true"}
-    current_user = {"username": "admin_user", "role": "administrator"}
-
-    response = asyncio.run(
-        update_policy_endpoint.update_policy(
-            policy="p1",
-            payload=payload,
-            current_user=current_user,
-            pgpool=mock_pgpool(connection),
-        )
-    )
-
-    sql_calls = [c.args[0] for c in connection.execute.await_args_list]
-    assert any('SET LOCAL ROLE "administrator";' in sql for sql in sql_calls)
-    assert not any("RESET ROLE" in sql for sql in sql_calls)
+    assert not any("CREATE POLICY" in sql for sql in sql_calls)
     assert response.status_code == 200
+
+
+# PATCH /Policies was removed: in-place policy editing depended on the
+# per-PG-role model. Policy changes are now DELETE + POST.

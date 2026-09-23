@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 import asyncpg
 import ujson
 from app import (
+    ANONYMOUS_VIEWER,
+    AUTHORIZATION,
     COUNT_ESTIMATE_THRESHOLD,
     COUNT_MODE,
     HOSTNAME,
@@ -29,9 +31,8 @@ from app import (
     VERSIONING,
 )
 from app.db.asyncpg_db import get_pool
-from app.db.audit_crud import AUDIT_ACTION_PUBLIC_READ, log_audit_event
 from app.db.redis_db import redis
-from app.oauth import get_optional_current_user
+from app.oauth import get_current_user
 from app.settings import serverSettings, tables
 from app.sta2rest import sta2rest
 from app.sta2rest.odata_query.exceptions import (
@@ -40,7 +41,7 @@ from app.sta2rest.odata_query.exceptions import (
 )
 from app.utils.utils import build_nextLink
 from app.v1.endpoints.functions import set_role
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .query_parameters import CommonQueryParams, get_common_query_params
@@ -49,9 +50,10 @@ v1 = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-# Universal optional-auth dependency: authenticated users get their own role;
-# unauthenticated / invalid-token requests fall back to the guest RLS context.
-user = Depends(get_optional_current_user)
+user = Header(default=None, include_in_schema=False)
+
+if AUTHORIZATION and not ANONYMOUS_VIEWER:
+    user = Depends(get_current_user)
 
 
 def __handle_root():
@@ -88,6 +90,60 @@ async def wrapped_result_generator(first_item, result):
             yield item
     finally:
         await result.aclose()
+
+
+async def stream_or_error(result, media_type="application/json"):
+    """Pull the first chunk off an asyncpg_stream_results() generator and
+    return either a StreamingResponse (data follows) or a JSONResponse
+    error. Centralises the empty-result / DB-error handling that each read
+    endpoint used to inline, and logs the real exception instead of
+    swallowing it into a bare 404.
+    """
+    try:
+        first_item = await anext(result)
+        return StreamingResponse(
+            wrapped_result_generator(first_item, result),
+            media_type=media_type,
+            status_code=status.HTTP_200_OK,
+        )
+    except StopAsyncIteration:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"code": 404, "type": "error", "message": "Not Found"},
+        )
+    except (
+        asyncpg.PostgresConnectionError,
+        asyncpg.TooManyConnectionsError,
+    ):
+        logger.exception("Database unavailable during initial stream fetch")
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "code": 503,
+                "type": "error",
+                "message": "Database temporarily unavailable",
+            },
+        )
+    except asyncpg.PostgresError:
+        logger.exception("PostgreSQL error during initial stream fetch")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "code": 500,
+                "type": "error",
+                "message": "Internal server error",
+            },
+        )
+    except Exception:
+        logger.exception("Unexpected error during initial stream fetch")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "code": 500,
+                "type": "error",
+                "message": "Internal server error",
+            },
+        )
 
 
 @v1.api_route(
@@ -135,6 +191,36 @@ async def catch_all_get(
         from_to_value = data.get("from_to_value")
         single_result = data.get("single_result")
         value = data.get("value")
+
+        # This catch-all resolves "Commit" as an entity via the STA2REST
+        # grammar unconditionally -- unlike GET /Commits (read/commit.py),
+        # that resolution is NOT gated on the VERSIONING flag, and this
+        # route enforces no admin check of its own. So a plain
+        # /istsos4/v1.1/Commits request reached the full, unscoped commit
+        # log (Commit has no RLS -- see read/commit.py's docstring) no
+        # matter what VERSIONING was set to, and to any authenticated role.
+        # Mirror read/commit.py's contract here so both paths to the same
+        # entity agree: VERSIONING off -> the entity doesn't exist;
+        # VERSIONING on -> administrator only.
+        if main_entity == "Commit":
+            if not VERSIONING:
+                return JSONResponse(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    content={
+                        "code": 404,
+                        "type": "error",
+                        "message": "Not Found",
+                    },
+                )
+            if current_user is not None and current_user["role"] != "administrator":
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={
+                        "code": 401,
+                        "type": "error",
+                        "message": "Insufficient privileges.",
+                    },
+                )
 
         result = asyncpg_stream_results(
             main_entity,
@@ -256,36 +342,11 @@ async def asyncpg_stream_results(
     async with pgpool.acquire() as connection:
         async with connection.transaction():
             if current_user is not None:
-                # Authenticated path: switch to the user's own PostgreSQL role.
                 await set_role(connection, current_user)
             else:
-                # Unauthenticated / Path A: fall back to the guest role so the
-                # is_public RLS policies on Datastream and Observation take effect.
-                # SET LOCAL ROLE guest runs BEFORE the audit INSERT -- the pool's
-                # base login role (ISTSOS_ADMIN) was never granted INSERT on
-                # AuditLog (only 'user'/'sensor', see 003_audit_log.sql, and
-                # 'guest' itself, see 004_public_access.sql); inserting before
-                # the role switch failed with an InsufficientPrivilegeError on
-                # every anonymous read, and -- since one failed statement
-                # poisons the rest of the open transaction in Postgres -- the
-                # swallowed exception below then made the *next* statement
-                # (the actual data query) 500 too. guest already has the grant
-                # it needs once the switch happens first.
-                current_user = {"username": "guest"}
-                await set_role(connection, current_user)
-                try:
-                    await log_audit_event(
-                        conn=connection,
-                        action_type=AUDIT_ACTION_PUBLIC_READ,
-                        actor_id=None,
-                        dataset_id=str(entity) if entity else None,
-                        payload={"path": str(full_path)},
-                    )
-                except Exception:
-                    # Audit logging is best-effort; never block the response.
-                    logger.warning(
-                        "PUBLIC_READ audit log failed for path=%r", full_path
-                    )
+                if ANONYMOUS_VIEWER:
+                    current_user = {"username": "guest"}
+                    await set_role(connection, current_user)
 
             if is_count:
                 if COUNT_MODE == "LIMIT_ESTIMATE":

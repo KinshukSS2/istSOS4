@@ -31,7 +31,7 @@ Design decisions
 
 import logging
 
-from app import POSTGRES_PORT_WRITE
+from app import NETWORK, POSTGRES_PORT_WRITE
 from app.db.asyncpg_db import get_pool, get_pool_w
 from app.rbac_roles import PENDING_ROLE
 from fastapi import HTTPException, status
@@ -39,26 +39,33 @@ from fastapi import HTTPException, status
 logger = logging.getLogger(__name__)
 
 
-async def update_user_role(user_id: int, new_role: str) -> None:
-    """Atomically update a user's application role.
+async def update_user_role(
+    user_id: int,
+    new_role: str | None = None,
+    new_dataset: str | None = None,
+) -> None:
+    """Atomically update an active user's role and/or Network scope.
 
-    Execution order (all within a single transaction):
+    All within a single transaction:
         1. SELECT … FOR UPDATE — fetch user row; 404 if missing.
-        2. Guard: pending users cannot be reassigned (400).
-        3. Guard: no-op if current_role == new_role (return early).
-        4. Guard: last-admin lockout — 409 if demoting the only admin.
-        5. UPDATE sensorthings."User" SET role = new_role WHERE id = user_id.
+        2. Guard: pending users cannot be changed here (400).
+        3. If ``new_role`` differs: last-admin lockout guard (409), then
+           UPDATE role.
+        4. If ``new_dataset`` is not None: validate against the Network
+           table (400 if unknown), then UPDATE dataset_id. ``""`` clears
+           the scope (NULL).
 
     Args:
-        user_id:  Primary key of the target User row.
-        new_role: Target application role (already validated by Pydantic schema).
+        user_id:     Primary key of the target User row.
+        new_role:    Target application role (Pydantic-validated), or None
+                     to leave it unchanged.
+        new_dataset: Network name to scope to, ``""`` to clear, or None to
+                     leave the scope unchanged.
 
     Raises:
         HTTPException 404: User not found.
-        HTTPException 400: User is in the 'pending' waiting room.
-        HTTPException 200: (early return) Role unchanged — no-op.
+        HTTPException 400: User is pending, or dataset is not a real Network.
         HTTPException 409: Would demote the last administrator.
-        HTTPException 500: Unexpected database error.
     """
     try:
         pool = await get_pool_w() if POSTGRES_PORT_WRITE else await get_pool()
@@ -68,12 +75,9 @@ async def update_user_role(user_id: int, new_role: str) -> None:
     async with pool.acquire() as conn:
         async with conn.transaction():
 
-            # ------------------------------------------------------------------
-            # 1. Fetch the target user row with a row-level lock.
-            # ------------------------------------------------------------------
             row = await conn.fetchrow(
                 """
-                SELECT id, username, role
+                SELECT id, username, role, dataset_id
                 FROM sensorthings."User"
                 WHERE id = $1
                 FOR UPDATE
@@ -90,65 +94,70 @@ async def update_user_role(user_id: int, new_role: str) -> None:
             current_role = row["role"]
             username = row["username"]
 
-            # ------------------------------------------------------------------
-            # 2. Guard: pending users have no PG role — reassignment is invalid.
-            # ------------------------------------------------------------------
             if current_role == PENDING_ROLE:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=(
-                        "Cannot reassign role for a pending user. "
-                        "Activate the account first via POST /Users/{id}/activate."
+                        "Cannot change a pending user here. Activate the "
+                        "account first via POST /Users/{id}/activate."
                     ),
                 )
 
-            # ------------------------------------------------------------------
-            # 3. No-op guard — avoid unnecessary DDL.
-            # ------------------------------------------------------------------
-            if current_role == new_role:
-                logger.info(
-                    "Role reassignment for user %r (id=%d) is a no-op "
-                    "(already '%s').",
-                    username, user_id, new_role,
-                )
-                return  # 204 with no DB mutation
+            changes = []
 
-            # ------------------------------------------------------------------
-            # 4. Last-administrator lockout guard.
-            #    Only fires when the user being reassigned is currently an admin.
-            # ------------------------------------------------------------------
-            if current_role == "administrator":
-                admin_count = await conn.fetchval(
-                    """
-                    SELECT COUNT(*)
-                    FROM sensorthings."User"
-                    WHERE role = 'administrator'
-                    """,
+            # --- role ---------------------------------------------------
+            if new_role is not None and new_role != current_role:
+                if current_role == "administrator":
+                    admin_count = await conn.fetchval(
+                        'SELECT COUNT(*) FROM sensorthings."User" '
+                        "WHERE role = 'administrator'"
+                    )
+                    if admin_count <= 1:
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=(
+                                "Cannot demote the last administrator. "
+                                "Promote another user first."
+                            ),
+                        )
+                await conn.execute(
+                    'UPDATE sensorthings."User" SET role = $1 WHERE id = $2',
+                    new_role,
+                    user_id,
                 )
-                if admin_count <= 1:
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail=(
-                            "Cannot demote the last administrator. "
-                            "Promote another user to administrator first."
-                        ),
+                changes.append(f"role {current_role!r} -> {new_role!r}")
+
+            # --- network scope ----------------------------------------
+            if new_dataset is not None:
+                scope = new_dataset.strip() or None
+                if scope is not None and NETWORK:
+                    exists = await conn.fetchval(
+                        'SELECT 1 FROM sensorthings."Network" WHERE name = $1',
+                        scope,
+                    )
+                    if not exists:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=(
+                                f"No Network named '{scope}'. dataset must "
+                                "match an existing Network."
+                            ),
+                        )
+                if scope != row["dataset_id"]:
+                    await conn.execute(
+                        'UPDATE sensorthings."User" SET dataset_id = $1 '
+                        "WHERE id = $2",
+                        scope,
+                        user_id,
+                    )
+                    changes.append(
+                        f"scope {row['dataset_id']!r} -> {scope!r}"
                     )
 
-            # ------------------------------------------------------------------
-            # 5. Update the application-layer role in the User table.
-            # ------------------------------------------------------------------
-            await conn.execute(
-                """
-                UPDATE sensorthings."User"
-                SET role = $1
-                WHERE id = $2
-                """,
-                new_role,
-                user_id,
-            )
-
     logger.info(
-        "Role for user %r (id=%d) updated: %r → %r.",
-        username, user_id, current_role, new_role,
+        "User %r (id=%d): %s",
+        username,
+        user_id,
+        ", ".join(changes) if changes else "no change",
     )
 

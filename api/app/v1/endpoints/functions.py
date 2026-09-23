@@ -55,15 +55,12 @@ async def set_role(connection, current_user):
 
     Also sets the ``app.current_user_id`` session variable via
     ``set_config(..., is_local=true)`` — same transaction-scoped lifetime
-    as the role switch. RLS policies read this back (see
-    sensorthings.current_app_user_role() / current_app_user_dataset_id() in
-    007_session_scoped_rls_policies.sql) to tell individual callers apart
-    even though several application roles share one PostgreSQL group role
-    — e.g. 'viewer' and 'editor' both run as "user". Group-role-scoped
-    ``TO <username>`` policies could never match any real session (no
-    application code path ever creates an individual login role for a
-    user); this session claim is what makes per-user/per-dataset filtering
-    actually work without needing one.
+    as the role switch. The RLS policies in
+    006_session_scoped_rls_policies.sql read it back (via
+    current_app_user_role() / current_app_user_network_id()) to tell
+    individual callers apart even though several application roles share
+    one PostgreSQL group role — e.g. 'viewer' and 'editor' both run as
+    "user" — and to apply each user's Network scope.
 
     Must be called **inside** an open ``connection.transaction()`` block.
     """

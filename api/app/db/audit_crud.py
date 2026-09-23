@@ -53,7 +53,6 @@ async def log_audit_event(
     action_type: str,
     actor_id: int | None = None,
     dataset_id: str | None = None,
-    odrl_policy_id: str | None = None,
     payload: dict | None = None,
 ) -> None:
     """Insert a single row into sensorthings."AuditLog".
@@ -70,11 +69,8 @@ async def log_audit_event(
         actor_id:        Primary key of the sensorthings."User" row that
                          triggered the event.  Pass ``None`` for anonymous
                          (unauthenticated) actions such as PUBLIC_READ.
-        dataset_id:      Human-readable or URI identifier for the STAC dataset
-                         being accessed or requested.  Optional.
-        odrl_policy_id:  Identifier of the ODRL policy document associated
-                         with a RESTRICTED_REQUEST or ADMIN_APPROVAL event.
-                         Optional.
+        dataset_id:      Name of the Network the event concerns (requested or
+                         granted).  Optional.
         payload:         Arbitrary JSON-serialisable metadata dict.  Optional.
                          asyncpg does not auto-serialise dicts to JSONB; this
                          function handles that conversion internally.
@@ -93,21 +89,19 @@ async def log_audit_event(
     await conn.execute(
         """
         INSERT INTO sensorthings."AuditLog"
-            (actor_id, action_type, dataset_id, odrl_policy_id, payload)
+            (actor_id, action_type, dataset_id, payload)
         VALUES
-            ($1, $2, $3, $4, $5::jsonb)
+            ($1, $2, $3, $4::jsonb)
         """,
         actor_id,
         action_type,
         dataset_id,
-        odrl_policy_id,
         payload_json,
     )
 
     logger.info(
-        "AuditLog: action=%r actor_id=%r dataset=%r policy=%r",
+        "AuditLog: action=%r actor_id=%r dataset=%r",
         action_type,
         actor_id,
         dataset_id,
-        odrl_policy_id,
     )

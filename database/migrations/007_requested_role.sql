@@ -13,13 +13,13 @@
 -- limitations under the License.
 
 -- =============================================================================
--- Migration: 008_requested_role
+-- Migration: 007_requested_role
 -- Description: Lets an applicant state which RBAC role they want at
 --              registration, instead of an administrator inventing one from
 --              nothing at approval time.
 --
 --              Before this, RestrictedRegistrationRequest and the OIDC
---              provisioning path collected dataset_id/odrl_policy_id but no
+--              provisioning path collected dataset_id but no
 --              role signal at all -- an admin reviewing GET /Users had
 --              nothing structured to go on beyond a free-text explanation
 --              field, and had to guess or ask separately what access level
@@ -27,8 +27,8 @@
 --
 -- Design decisions
 -- ----------------
--- * Nullable TEXT, same pattern as dataset_id/odrl_policy_id
---   (006_user_dataset_policy.sql). NULL for already-active users and for
+-- * Nullable TEXT, same pattern as dataset_id
+--   (005_user_dataset_policy.sql). NULL for already-active users and for
 --   accounts created directly via POST /Users, where an administrator
 --   picks the role at creation time and there is no separate "request"
 --   phase to record.

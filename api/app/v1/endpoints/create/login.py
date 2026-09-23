@@ -24,6 +24,7 @@ from app.oauth import (
     decode_token,
     oauth2_scheme_optional,
 )
+from app.rbac_roles import PENDING_ROLE
 from app.v1.endpoints.openapi_responses import (
     BAD_REQUEST_TOKEN_FORMAT,
     LOGIN_FAILED,
@@ -84,6 +85,14 @@ async def login(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
+        )
+    if user_data["role"] == PENDING_ROLE:
+        # Credentials are valid but the account is still in the waiting
+        # room. Reject here rather than handing back a token that would be
+        # refused with 403 on the very next request.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is pending administrator approval.",
         )
     access_token, expire = create_access_token(data=user_data)
 

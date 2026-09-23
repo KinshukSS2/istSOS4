@@ -13,7 +13,7 @@
 -- limitations under the License.
 
 -- =============================================================================
--- Migration: 009_oidc_duplicate_hint
+-- Migration: 008_oidc_duplicate_hint
 -- Description: Adds an advisory-only column so an administrator reviewing
 --              the pending queue (GET /Users) can see when a brand-new
 --              OIDC signup's email matches an already-existing, unrelated

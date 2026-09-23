@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from app import AUTHORIZATION, NETWORK, VERSIONING
+from fastapi.openapi.utils import get_openapi
 from app.v1.custom_docs import register_custom_docs
 from app.v1.docs_description import V1_DESCRIPTION
 from app.v1.endpoints.create import bulk_observation, data_array_observation
@@ -86,7 +87,6 @@ from app.v1.endpoints.update import observation as update_observation
 from app.v1.endpoints.update import (
     observed_property as update_observed_property,
 )
-from app.v1.endpoints.update import policy as update_policy
 from app.v1.endpoints.update import sensor as update_sensor
 from app.v1.endpoints.update import thing as update_thing
 from app.v1.endpoints.update import user as update_user
@@ -247,7 +247,6 @@ if AUTHORIZATION:
     v1.include_router(delete_user.v1)
     v1.include_router(read_policy.v1)
     v1.include_router(create_policy.v1)
-    v1.include_router(update_policy.v1)
     v1.include_router(delete_policy.v1)
 
 
@@ -303,3 +302,63 @@ v1.include_router(delete_datastream.v1)
 v1.include_router(delete_feature_of_interest.v1)
 v1.include_router(delete_observation.v1)
 v1.include_router(filtered_delete_observation.v1)
+
+
+# ---------------------------------------------------------------------------
+# Swagger "Authorize" — add a paste-a-bearer-token option.
+#
+# FastAPI derives the security schemes from the dependencies, so the only one
+# advertised is OAuth2PasswordBearer (username + password against /Login).
+# A user who signed in through an external identity provider has no local
+# password at all, so that dialog cannot authorize them and there was no way
+# to exercise the API as an OIDC user from /docs.
+#
+# BearerAuth adds a plain "paste the token" field alongside it: complete the
+# browser round trip at GET /auth/{provider}/login, copy the access_token the
+# callback returns, and paste it here. Documentation-only -- get_current_user
+# already accepts any Authorization: Bearer header regardless of how the token
+# was minted, so no runtime behaviour changes.
+# ---------------------------------------------------------------------------
+if AUTHORIZATION:
+
+    def _custom_openapi():
+        if v1.openapi_schema:
+            return v1.openapi_schema
+        schema = get_openapi(
+            title=v1.title,
+            version=v1.version,
+            description=v1.description,
+            routes=v1.routes,
+            tags=v1.openapi_tags,
+        )
+        schemes = schema.setdefault("components", {}).setdefault(
+            "securitySchemes", {}
+        )
+        schemes["BearerAuth"] = {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "JWT",
+            "description": (
+                "Paste a raw JWT. Use this for an account that signed in "
+                "through an external identity provider (OIDC): run "
+                "GET /auth/{provider}/login in a browser tab, and the "
+                "callback returns the `access_token` to paste here. A local "
+                "account can use either this or the username/password "
+                "dialog above."
+            ),
+        }
+        # Offer BearerAuth wherever the password flow is already offered, so
+        # both appear in the Authorize dialog for every protected operation.
+        for path_item in schema.get("paths", {}).values():
+            for operation in path_item.values():
+                if not isinstance(operation, dict):
+                    continue
+                security = operation.get("security")
+                if not security:
+                    continue
+                if not any("BearerAuth" in entry for entry in security):
+                    security.append({"BearerAuth": []})
+        v1.openapi_schema = schema
+        return schema
+
+    v1.openapi = _custom_openapi

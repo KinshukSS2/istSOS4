@@ -14,21 +14,24 @@
 
 import json
 
-from app import REDIS
+from app import ANONYMOUS_VIEWER, AUTHORIZATION, REDIS
 from app.db.asyncpg_db import get_pool
 from app.db.redis_db import redis
 from app.sta2rest import sta2rest
-from fastapi import APIRouter, Depends, Request, status
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import APIRouter, Depends, Header, Request, status
+from fastapi.responses import JSONResponse
 
 from .query_parameters import CommonQueryParams, get_common_query_params
-from .read import asyncpg_stream_results, wrapped_result_generator
-
-from app.oauth import get_optional_current_user
+from .read import asyncpg_stream_results, stream_or_error
 
 v1 = APIRouter()
 
-user = Depends(get_optional_current_user)
+user = Header(default=None, include_in_schema=False)
+
+if AUTHORIZATION and not ANONYMOUS_VIEWER:
+    from app.oauth import get_current_user
+
+    user = Depends(get_current_user)
 
 
 @v1.api_route(
@@ -86,22 +89,7 @@ async def get_features_of_interest(
             current_user,
         )
 
-        try:
-            first_item = await anext(result)
-            return StreamingResponse(
-                wrapped_result_generator(first_item, result),
-                media_type="application/json",
-                status_code=status.HTTP_200_OK,
-            )
-        except Exception as e:
-            return JSONResponse(
-                status_code=status.HTTP_404_NOT_FOUND,
-                content={
-                    "code": 404,
-                    "type": "error",
-                    "message": "Not Found",
-                },
-            )
+        return await stream_or_error(result)
     except Exception as e:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,

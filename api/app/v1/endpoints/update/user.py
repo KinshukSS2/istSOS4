@@ -167,12 +167,12 @@ async def update_user(
 
         return Response(status_code=status.HTTP_200_OK)
 
-    except UndefinedObjectError as e:
+    except UndefinedObjectError:
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
             content={"message": "User not found"},
         )
-    except InsufficientPrivilegeError as e:
+    except InsufficientPrivilegeError:
         return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
             content={"message": "Insufficient privileges"},

@@ -15,6 +15,7 @@
 import ujson
 from app import AUTHORIZATION
 from app.db.asyncpg_db import get_pool
+from app.rbac_roles import PENDING_ROLE
 from asyncpg.exceptions import InsufficientPrivilegeError
 from fastapi import APIRouter, Depends, Header, status
 from fastapi.responses import JSONResponse
@@ -81,13 +82,45 @@ async def get_users(
 
                     await set_role(connection, current_user)
 
+                # ORDER BY id: without it Postgres returns rows in physical
+                # heap order, which isn't insertion order -- an UPDATE
+                # (approve/reject/role-change/deactivate) writes a new row
+                # version elsewhere in the heap, so a user's position drifts
+                # every time their row changes. id is the primary key, so
+                # this is a stable, natural order at negligible cost for an
+                # admin-sized table.
                 query = """
                     SELECT row_to_json(t) AS users
-                    FROM (SELECT * FROM sensorthings."User") t;
+                    FROM (SELECT * FROM sensorthings."User" ORDER BY id) t;
                 """
                 users = await connection.fetch(query)
 
-                users = [ujson.loads(record["users"]) for record in users]
+                # Never expose the bcrypt hash. `SELECT *` is kept (rather
+                # than an explicit column list) so the query still works
+                # when AUTHORIZATION=0 and the migrations that add
+                # `password`/`status`/... never ran; the secret column is
+                # stripped here instead.
+                #
+                # `role` is reported as null for a not-yet-approved account.
+                # In the DB the column holds the sentinel 'pending' -- an
+                # internal, zero-privilege, non-RBAC value that every auth
+                # gate keys on (get_current_user 403, /Login 403, the
+                # `WHERE role = 'pending'` approve/reject guards, the RLS
+                # "matches no policy" fail-close). Surfacing that literally,
+                # next to status:'pending' / status:'rejected', misreads as
+                # "their role is pending". `requested_role` already carries
+                # what the applicant asked for. Active users are untouched.
+                cleaned = []
+                for record in users:
+                    row = {
+                        key: value
+                        for key, value in ujson.loads(record["users"]).items()
+                        if key != "password"
+                    }
+                    if row.get("role") == PENDING_ROLE:
+                        row["role"] = None
+                    cleaned.append(row)
+                users = cleaned
 
 
                 return JSONResponse(

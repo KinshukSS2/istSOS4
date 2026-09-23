@@ -12,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import json
 import logging
 
 from app import HOSTNAME, POSTGRES_PORT_WRITE, SUBPATH, VERSION
 from app.db.asyncpg_db import get_pool, get_pool_w
+from app.db.password_crud import pwd_context
 from app.oauth import get_current_user
-from app.rbac_roles import get_db_role_for_rbac, validate_rbac_role
-from app.utils.utils import pg_quote_ident, validate_username
+from app.rbac_roles import validate_rbac_role
+from app.utils.utils import validate_username
+from app.validators import validate_password_strength
 from app.v1.endpoints.functions import insert_commit, set_role
 from app.v1.endpoints.openapi_responses import (
     DB_TIMEOUT,
@@ -44,7 +47,7 @@ PAYLOAD_EXAMPLE = {
     "username": "cp1",
     "password": "qwertz",
     "uri": "https://orcid.org/0000-0004-3456-7890",
-    "role": "viewer",  # viewer, editor, obs_manager, sensor, qc, odrl_governed
+    "role": "viewer",  # viewer, editor, obs_manager, sensor, qc, custom
 }
 
 @v1.api_route(
@@ -144,7 +147,19 @@ async def create_user(
 
                     await set_role(connection, current_user)
 
-                password = payload.pop("password", None)
+                # Hash the password and put it back as a bcrypt hash so the
+                # dynamic INSERT below writes it to "User".password. istSOS
+                # users are not PostgreSQL roles -- there is no CREATE USER
+                # / WITH ENCRYPTED PASSWORD; /Login verifies against this
+                # column (same as the /Register path in
+                # create/register_request.py).
+                raw_password = payload.pop("password", None)
+                if not isinstance(raw_password, str):
+                    raise ValueError("Password must be a string.")
+                validate_password_strength(raw_password)
+                payload["password"] = await asyncio.to_thread(
+                    pwd_context.hash, raw_password
+                )
 
                 for key in list(payload.keys()):
                     if isinstance(payload[key], dict):
@@ -192,17 +207,19 @@ async def create_user(
                     await insert_commit(connection, commit, "UPDATE")
 
                 # No RLS DDL needed here: as of
-                # 007_session_scoped_rls_policies.sql, viewer/editor/
-                # obs_manager/sensor/qc access is enforced by static
-                # policies created once by that migration, not per-user.
-                # odrl_governed is the one role still needing a
-                # per-approval CREATE POLICY call (see
-                # update/admin_approval.py) — this endpoint never collects
-                # a dataset_id, so it correctly can't grant that role
-                # anything meaningful anyway.
+                # 006_session_scoped_rls_policies.sql, every assignable
+                # role's access is enforced by static policies created once
+                # by that migration, not per-user. Creating a user is a
+                # plain INSERT + role column; a 'custom' user's narrower
+                # rule (if any) is added later via POST /Policies.
 
         return Response(status_code=status.HTTP_201_CREATED)
 
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"message": str(exc)},
+        )
     except UniqueViolationError:
         return JSONResponse(
             status_code=status.HTTP_409_CONFLICT,

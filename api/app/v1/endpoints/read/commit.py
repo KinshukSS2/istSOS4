@@ -14,21 +14,25 @@
 
 import json
 
-from app import REDIS
+from app import ANONYMOUS_VIEWER, AUTHORIZATION, REDIS
 from app.db.asyncpg_db import get_pool
 from app.db.redis_db import redis
 from app.sta2rest import sta2rest
-from fastapi import APIRouter, Depends, Request, status
-from fastapi.responses import JSONResponse, StreamingResponse
+from asyncpg.exceptions import InsufficientPrivilegeError
+from fastapi import APIRouter, Depends, Header, Request, status
+from fastapi.responses import JSONResponse
 
 from .query_parameters import CommonQueryParams, get_common_query_params
-from .read import asyncpg_stream_results, wrapped_result_generator
-
-from app.oauth import get_optional_current_user
+from .read import asyncpg_stream_results, stream_or_error
 
 v1 = APIRouter()
 
-user = Depends(get_optional_current_user)
+user = Header(default=None, include_in_schema=False)
+
+if AUTHORIZATION and not ANONYMOUS_VIEWER:
+    from app.oauth import get_current_user
+
+    user = Depends(get_current_user)
 
 
 @v1.api_route(
@@ -36,8 +40,12 @@ user = Depends(get_optional_current_user)
     methods=["GET"],
     tags=["Commits"],
     summary="Get all commits",
-    description="Returns the commit history for all entities. "
-    "Requires VERSIONING=1 in the environment configuration.",
+    description="Returns the commit history for all entities -- who "
+    "changed what, and when -- across every dataset/Network. "
+    "Administrator-only: a Commit carries no per-Network column of its "
+    "own to scope on, so any non-admin role would see every network's "
+    "edit history, not just its own. Requires VERSIONING=1 in the "
+    "environment configuration.",
     status_code=status.HTTP_200_OK,
 )
 async def get_commits(
@@ -47,6 +55,16 @@ async def get_commits(
     params: CommonQueryParams = Depends(get_common_query_params),
 ):
     try:
+        # The Commit log has no RLS of its own -- the "user" group role's
+        # blanket GRANT SELECT ON ALL TABLES (istsos_auth.sql) would let
+        # ANY authenticated role read every commit, across every user and
+        # every Network, once set_role() runs. Gate it here at the
+        # application layer instead, the same way GET /Users and
+        # GET /Policies are admin-only for the same reason (no clean
+        # per-user / per-network row filter to write a policy against).
+        if current_user is not None and current_user["role"] != "administrator":
+            raise InsufficientPrivilegeError
+
         full_path = request.url.path
         if request.url.query:
             full_path += "?" + request.url.query
@@ -87,22 +105,16 @@ async def get_commits(
             current_user,
         )
 
-        try:
-            first_item = await anext(result)
-            return StreamingResponse(
-                wrapped_result_generator(first_item, result),
-                media_type="application/json",
-                status_code=status.HTTP_200_OK,
-            )
-        except Exception as e:
-            return JSONResponse(
-                status_code=status.HTTP_404_NOT_FOUND,
-                content={
-                    "code": 404,
-                    "type": "error",
-                    "message": "Not Found",
-                },
-            )
+        return await stream_or_error(result)
+    except InsufficientPrivilegeError:
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={
+                "code": 401,
+                "type": "error",
+                "message": "Insufficient privileges.",
+            },
+        )
     except Exception as e:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,

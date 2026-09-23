@@ -97,8 +97,8 @@ class _SingleConnPool:
 
 async def _seed_pending_oidc_user(connection, admin_username):
     """An administrator, plus a 'pending' user shaped like a real
-    JIT-provisioned OIDC signup -- auth_provider/requested_role/dataset_id/
-    odrl_policy_id all set, exactly what create_pending_oidc_user() writes."""
+    JIT-provisioned OIDC signup -- auth_provider/requested_role/dataset_id
+    all set, exactly what create_pending_oidc_user() writes."""
     await set_role(connection, {"role": "administrator"})
 
     admin_id = await connection.fetchval(
@@ -111,15 +111,14 @@ async def _seed_pending_oidc_user(connection, admin_username):
     pending_id = await connection.fetchval(
         """
         INSERT INTO sensorthings."User"
-            (username, role, auth_provider, external_sub_id,
-             dataset_id, odrl_policy_id, requested_role)
-        VALUES ($1, 'pending', 'google', $2, $3, $4, 'viewer')
+            (username, role, status, auth_provider, external_sub_id,
+             dataset_id, requested_role)
+        VALUES ($1, 'pending', 'pending', 'google', $2, $3, 'viewer')
         RETURNING id;
         """,
         f"{_MARKER}_oidc_user",
         f"sub-{_MARKER}",
-        f"stac://{_MARKER}-dataset",
-        f"odrl:policy:{_MARKER}",
+        f"{_MARKER}-network",
     )
     return admin_id, pending_id
 
@@ -154,7 +153,7 @@ def test_activation_writes_admin_approval_audit_event():
 
                 audit_row = await connection.fetchrow(
                     """
-                    SELECT actor_id, action_type, dataset_id, odrl_policy_id, payload
+                    SELECT actor_id, action_type, dataset_id, payload
                     FROM sensorthings."AuditLog"
                     WHERE action_type = 'ADMIN_APPROVAL'
                       AND (payload ->> 'activated_user_id')::bigint = $1
@@ -171,8 +170,7 @@ def test_activation_writes_admin_approval_audit_event():
                     "actor_id must record the administrator who activated "
                     f"the account, got {audit_row['actor_id']!r}"
                 )
-                assert audit_row["dataset_id"] == f"stac://{_MARKER}-dataset"
-                assert audit_row["odrl_policy_id"] == f"odrl:policy:{_MARKER}"
+                assert audit_row["dataset_id"] == f"{_MARKER}-network"
                 # asyncpg returns jsonb as a raw string, not an auto-parsed dict.
                 payload = json.loads(audit_row["payload"])
                 assert payload["granted_role"] == "viewer"

@@ -69,12 +69,14 @@ _PROVIDER_ENV_PREFIX = {
 # than at import time, which is what made this take a live test to catch.
 # `os.getenv(key) or default` treats None and "" the same way.
 _OIDC_DISCOVERY_URLS = {
-    "google": "https://accounts.google.com/.well-known/openid-configuration",
+    "google": os.getenv("GOOGLE_DISCOVERY_URL")
+    or "https://accounts.google.com/.well-known/openid-configuration",
     "microsoft": os.getenv("MICROSOFT_DISCOVERY_URL")
     or "https://login.microsoftonline.com/common/v2.0/.well-known/openid-configuration",
     "orcid": os.getenv("ORCID_DISCOVERY_URL")
     or "https://orcid.org/.well-known/openid-configuration",
-    "eduid": "https://login.eduid.ch/.well-known/openid-configuration",
+    "eduid": os.getenv("EDUID_DISCOVERY_URL")
+    or "https://login.eduid.ch/.well-known/openid-configuration",
 }
 
 # Populated below, at import time, with whichever providers have both env

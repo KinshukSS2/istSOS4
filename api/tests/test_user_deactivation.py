@@ -74,7 +74,6 @@ from app.oauth import (  # noqa: E402
     authenticate_user,
     create_access_token,
     get_current_user,
-    get_optional_current_user,
 )
 from app.rbac_roles import DELETED_STATUS  # noqa: E402
 from app.v1.endpoints.functions import set_role  # noqa: E402
@@ -303,15 +302,10 @@ def test_deactivated_user_existing_jwt_is_rejected_on_next_use():
                 await deactivate_conn.close()
 
             # Same token, no re-issue, no revocation call -- must now be
-            # rejected.
+            # rejected with 403.
             with pytest.raises(Exception) as exc_info:
                 await get_current_user(token=token)
             assert getattr(exc_info.value, "status_code", None) == 403
-
-            # get_optional_current_user must treat it as anonymous (None),
-            # not raise -- same contract as a pending user.
-            optional_result = await get_optional_current_user(token=token)
-            assert optional_result is None
         finally:
             await _cleanup_committed_user(username)
 

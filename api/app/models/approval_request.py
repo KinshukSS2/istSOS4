@@ -20,9 +20,9 @@ Design decisions
   instantiation time (field_validator), so the endpoint handler never
   receives an unknown or internal role (e.g. 'pending', 'administrator').
 
-* ``dataset_id`` and ``odrl_policy_id`` are plain strings — they are
-  forwarded verbatim into the AuditLog and are not looked up in the DB
-  by this model; validation of their *existence* happens at the DB layer.
+* ``dataset_id`` is a plain string (a Network name). The model does not
+  validate it; the endpoint handler checks it against the Network table
+  before writing it to ``User.dataset_id``.
 
 * The model intentionally carries no auth context; the endpoint handler
   enforces the administrator check via Depends(get_current_user).
@@ -46,26 +46,21 @@ class AdminApprovalRequest(BaseModel):
                      administrator is the final gatekeeper either way. Must
                      be one of the assignable roles defined in
                      ``VALID_RBAC_ROLES`` (viewer, editor, obs_manager,
-                     sensor, qc, odrl_governed) if given.  The internal
+                     sensor, qc, custom) if given.  The internal
                      'pending' state and 'administrator' may NOT be set
                      through this endpoint.
-    dataset_id:      Human-readable or URI identifier for the STAC dataset
-                     to which access is being granted.  Forwarded to
-                     AuditLog, and -- when assigned_role is
-                     'odrl_governed' -- used directly to build the
-                     dataset-scoped row-level-security predicate.
-    odrl_policy_id:  Identifier of the ODRL policy document that governs
-                     access to the dataset.  Forwarded to AuditLog only;
-                     not parsed or resolved by this API.
+    dataset_id:      Name of the Network to scope the user to. Optional --
+                     omit for unrestricted access, or to keep whatever the
+                     applicant requested. Written to User.dataset_id and
+                     forwarded to AuditLog. Must match an existing Network.
     """
 
     model_config = ConfigDict(
         json_schema_extra={
             "examples": [
                 {
-                    "assigned_role": "odrl_governed",
-                    "dataset_id": "stac://alpine-snow-2024",
-                    "odrl_policy_id": "odrl:policy:cc-by-nc",
+                    "assigned_role": "viewer",
+                    "dataset_id": "IDROLOGIA",
                 }
             ]
         }
@@ -78,27 +73,21 @@ class AdminApprovalRequest(BaseModel):
             "applicant requested at registration. `administrator` and "
             "`pending` are rejected -- see the model docstring."
         ),
-        examples=["odrl_governed"],
+        examples=["viewer"],
         # See app/models/role.py for why this is json_schema_extra and not
         # a Literal/Enum type: the validator normalises with
         # .strip().lower() after Pydantic's own coercion, and an enum type
         # would reject non-canonical casing before that ever runs.
         json_schema_extra={"enum": ASSIGNABLE_ROLES},
     )
-    dataset_id: str = Field(
+    dataset_id: str | None = Field(
+        default=None,
         description=(
-            "Dataset identifier. Forwarded to the audit log; also becomes "
-            "the row-level-security predicate's value when assigned_role "
-            "is `odrl_governed`."
+            "Name of the Network to scope this user to. Omit to leave the "
+            "applicant's requested value unchanged, or send an empty string "
+            "to clear any scope. Must match an existing Network."
         ),
-        examples=["stac://alpine-snow-2024"],
-    )
-    odrl_policy_id: str = Field(
-        description=(
-            "ODRL policy document identifier. Recorded for audit purposes "
-            "only -- not parsed or resolved by this API."
-        ),
-        examples=["odrl:policy:cc-by-nc"],
+        examples=["IDROLOGIA"],
     )
 
     @field_validator("assigned_role")
@@ -124,6 +113,5 @@ class ApprovalResponse(BaseModel):
 
     message: str = Field(examples=["User 'jdoe' (id=42) has been approved with role 'viewer'."])
     user_id: int = Field(examples=[42])
-    granted_role: str = Field(examples=["odrl_governed"])
-    dataset_id: str = Field(examples=["stac://alpine-snow-2024"])
-    odrl_policy_id: str = Field(examples=["odrl:policy:cc-by-nc"])
+    granted_role: str = Field(examples=["viewer"])
+    dataset_id: str | None = Field(default=None, examples=["IDROLOGIA"])

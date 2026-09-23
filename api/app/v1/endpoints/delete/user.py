@@ -29,21 +29,18 @@ even by an administrator, is the more important property to keep.
 This endpoint sets sensorthings."User".status = 'deleted' instead. The
 row, and every AuditLog entry that references it, is left alone.
 DELETED_STATUS is enforced at the auth layer (see app/oauth.py:
-authenticate_user, get_current_user, get_optional_current_user) --
-checked live on every request, the same way role already is, so a
-deactivated user's still-valid JWT stops working on its very next use
-with no token revocation step needed.
+authenticate_user, get_current_user) -- checked live on every request,
+the same way role already is, so a deactivated user's still-valid JWT
+stops working on its very next use with no token revocation step needed.
 
 What this endpoint deliberately no longer does
 ------------------------------------------------
-The previous hard-delete implementation also called
-sensorthings.remove_user_from_policy() and DROP ROLE. Neither is needed
-now: a deactivated user is rejected at the auth layer before any query
-ever runs, so it no longer matters whether a stale custom policy still
-names them. DROP ROLE was calling for a PostgreSQL login role that never
-existed for any application user in the first place (no code path here
-creates one -- see activate_user.py's own architecture note) and always
-failed; it was dead code left over from before that pivot.
+The previous hard-delete implementation also dropped per-user RLS
+policies and ran DROP ROLE. Neither is needed now: a deactivated user is
+rejected at the auth layer before any query runs, so a stale custom
+policy naming them is harmless, and there is no per-user PostgreSQL role
+to drop (the backend connects as one service account -- see
+activate_user.py's architecture note).
 """
 
 from app import POSTGRES_PORT_WRITE
