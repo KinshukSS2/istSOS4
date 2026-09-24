@@ -399,12 +399,24 @@ def main():
     # ==================================================================
     r = requests.post(f"{BASE}/Refresh", headers=H(admin), timeout=10)
     check("POST /Refresh -> 2xx", 200 <= r.status_code < 300, f"HTTP {r.status_code}")
+    # With REDIS=1, /Refresh revokes the token it was called with, so carry on
+    # with the fresh one it returns (harmless with REDIS=0).
+    if r.ok and r.json().get("access_token"):
+        admin = r.json()["access_token"]
     throw = tok_of(login(du, PW))
     r = requests.post(f"{BASE}/Logout", headers=H(throw), timeout=10)
     check("POST /Logout -> 2xx", 200 <= r.status_code < 300, f"HTTP {r.status_code}")
+    # tokens carry no unique id: a login in the same second as the logout would
+    # get the identical, now-revoked string when REDIS=1
+    time.sleep(1.1)
     r = requests.get(f"{BASE}/Datastreams", params={"$top": 1}, headers=H(throw),
                      timeout=10)
-    redis_on = os.getenv("REDIS", "0") not in ("0", "", "false", "False")
+    # The deny-list is a property of the running API, not of this script's
+    # shell, so ask the container (fall back to the caller's env).
+    api_env = subprocess.run(
+        ["docker", "exec", os.getenv("API_CONTAINER", "istsos4-api"), "printenv", "REDIS"],
+        capture_output=True, text=True).stdout.strip()
+    redis_on = (api_env or os.getenv("REDIS", "0")) not in ("0", "", "false", "False")
     if redis_on:
         check("token is revoked after logout -> 401", r.status_code == 401,
               f"HTTP {r.status_code}")

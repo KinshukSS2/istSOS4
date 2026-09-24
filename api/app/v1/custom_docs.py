@@ -74,9 +74,13 @@ body { background: var(--istsos-bg); }
     box-shadow: none;
     padding: 18px 0;
 }
+/* Only the bar's own headings are white. The Authorize dialog is rendered
+   INSIDE .scheme-container, so a blanket `label { color: #fff }` here turned
+   every dialog label (username, password, client_id, ...) white-on-white. */
 .swagger-ui .scheme-container .schemes-title,
-.swagger-ui .scheme-container label,
-.swagger-ui .scheme-container .schemes > label { color: #fff; }
+.swagger-ui .scheme-container .servers-title { color: #fff; }
+.swagger-ui .dialog-ux .modal-ux label,
+.swagger-ui .dialog-ux .modal-ux .auth-container label { color: #3b4151; }
 .swagger-ui .btn.authorize {
     background-color: var(--istsos-gold);
     color: var(--istsos-navy-dark);
@@ -135,6 +139,22 @@ body { background: var(--istsos-bg); }
 .swagger-ui section.models { border-color: var(--istsos-navy-light); }
 .swagger-ui section.models h4 { color: var(--istsos-navy); }
 .swagger-ui section.models .model-box { background: var(--istsos-bg); }
+
+/* Readability fixes for stock Swagger UI colors that fail WCAG AA. Hues are
+   unchanged, so operations still scan by color; only the label text on the
+   light method badges goes dark, and a few greys/reds are deepened. */
+.swagger-ui .opblock.opblock-get .opblock-summary-method,
+.swagger-ui .opblock.opblock-post .opblock-summary-method,
+.swagger-ui .opblock.opblock-put .opblock-summary-method,
+.swagger-ui .opblock.opblock-patch .opblock-summary-method,
+.swagger-ui .opblock.opblock-delete .opblock-summary-method { color: #0b1220; text-shadow: none; }
+.swagger-ui .info .title small { background: #4b5563; }
+.swagger-ui .info .title small.version-stamp { background: #3b7a09; }
+.swagger-ui .info .title small pre, .swagger-ui .info .title small pre.version { color: #fff; }
+.swagger-ui .json-schema-2020-12-expand-deep-button { color: #3b4151; }
+.swagger-ui .parameter__extension, .swagger-ui .parameter__in { color: #4b5563; }
+.swagger-ui .parameter__name.required span, .swagger-ui .parameter__name.required:after { color: #c62828; }
+.swagger-ui .highlight-code > .microlight, .swagger-ui .microlight { background: #1e1e1e !important; }
 """
 
 

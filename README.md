@@ -27,6 +27,14 @@ repository (nothing to pull except the base images), so re-run
 `docker compose up -d --build` after changing anything under `api/` or
 `database/`.
 
+**Logout and Redis.** `.env.example` ships with `REDIS=0`. With it, `POST /Logout`
+still answers "Successfully logged out" but the token keeps working until it
+expires, because the list of revoked tokens lives in Redis. To make logout
+actually revoke a token, set `REDIS=1` in `.env` and restart the API
+(`docker compose up -d api`; the Redis container is already part of the
+stack). Tokens carry no unique id, so logging in again within the same second
+as a logout returns the same, still-revoked token: wait a second.
+
 Re-running `docker compose up` is safe: the dummy-data generator skips itself
 when data already exists. To start again from a clean database:
 
