@@ -24,6 +24,7 @@
 #   ADMIN_USER / ADMIN_PASS   default admin / admin
 #   DB_CONTAINER  default istsos4-database
 
+import json
 import os
 import subprocess
 import sys
@@ -64,14 +65,15 @@ def admin_token():
     return r.json()["access_token"]
 
 
-def oidc_roundtrip(session, dataset_id=None, requested_role=None):
+def oidc_roundtrip(session, networks=None):
     """Drive login -> fake authorize -> callback. Returns the final
-    requests.Response from the istSOS callback."""
+    requests.Response from the istSOS callback.
+
+    ``networks`` is the grant list the applicant asks for before the
+    redirect: ``[{"network_name": [...], "role": "viewer"}]``."""
     params = {}
-    if dataset_id is not None:
-        params["dataset_id"] = dataset_id
-    if requested_role is not None:
-        params["requested_role"] = requested_role
+    if networks is not None:
+        params["networks"] = json.dumps(networks)
     r1 = session.get(f"{BASE}/auth/{PROVIDER}/login", params=params,
                      allow_redirects=False)
     assert r1.status_code == 302, f"/login expected 302, got {r1.status_code}"
@@ -146,20 +148,27 @@ def main():
 
     # --- 1. first OIDC login: unknown identity -> pending -------------
     s1 = requests.Session()
-    r = oidc_roundtrip(s1, dataset_id=net_name, requested_role="viewer")
+    r = oidc_roundtrip(
+        s1, networks=[{"network_name": [net_name], "role": "viewer"}])
     check("first OIDC callback -> 202 (pending)", r.status_code == 202,
           f"HTTP {r.status_code}: {r.text[:120]}")
 
     row = psql(
-        "SELECT id, role, status, dataset_id FROM sensorthings.\"User\" "
+        "SELECT id, role, status, "
+        "coalesce(requested_networks->0->>'role','') || '/' || "
+        "coalesce(requested_networks->0->'network_name'->>0,'') "
+        "FROM sensorthings.\"User\" "
         f"WHERE auth_provider='{PROVIDER}' AND external_sub_id='{external_sub}'"
     )
     check("pending OIDC user row created", bool(row), row)
-    uid, role, st, ds_col = (row.split("|") + ["", "", ""])[:4]
+    uid, role, st, req_col = (row.split("|") + ["", "", ""])[:4]
     check("new OIDC user role == pending", role == "pending", role)
     check("new OIDC user status == pending", st == "pending", st)
-    check("requested dataset stored on the row", ds_col == net_name,
-          f"{ds_col!r}")
+    check("requested networks stored on the row (a request, not a grant)",
+          req_col == f"viewer/{net_name}", f"{req_col!r}")
+    check("no grant exists yet",
+          psql(f'SELECT count(*) FROM sensorthings."UserGrant" '
+               f"WHERE user_id = {uid}") == "0")
 
     # --- 2. second OIDC login while still pending -> still 202 --------
     s2 = requests.Session()
@@ -167,19 +176,27 @@ def main():
     check("OIDC login while pending -> 202", r.status_code == 202,
           f"HTTP {r.status_code}")
 
-    # --- 3. admin approves with the network scope ---------------------
+    # --- 3. admin approves what was requested -----------------------
     r = requests.patch(
         f"{BASE}/Users/{uid}/policy-approval",
         headers={"Authorization": f"Bearer {tok}"},
-        json={"role": "viewer", "dataset": net_name},
+        json={"approve_as_requested": True},
     )
-    check("admin approval (role=viewer, dataset=network) -> 200",
+    check("admin approval (approve_as_requested) -> 200",
           r.status_code == 200, f"HTTP {r.status_code}: {r.text[:150]}")
-    role_after, ds_after = psql(
-        f'SELECT role, dataset_id FROM sensorthings."User" WHERE id = {uid}'
+    role_after, st_after = psql(
+        f'SELECT role, status FROM sensorthings."User" WHERE id = {uid}'
     ).split("|")
-    check("user role == viewer after activation", role_after == "viewer")
-    check("user dataset_id == network name", ds_after == net_name)
+    check("user is an active member after approval",
+          (role_after, st_after) == ("member", "active"),
+          f"{role_after}/{st_after}")
+    grant = psql(
+        'SELECT g.role || \'/\' || n.name FROM sensorthings."UserGrant" g '
+        'JOIN sensorthings."UserGrantNetwork" gn ON gn.grant_id = g.id '
+        'JOIN sensorthings."Network" n ON n.id = gn.network_id '
+        f"WHERE g.user_id = {uid}")
+    check("the saved grant is viewer on the requested Network",
+          grant == f"viewer/{net_name}", grant)
 
     # --- 4. OIDC login now succeeds with a real JWT -----------------
     s3 = requests.Session()

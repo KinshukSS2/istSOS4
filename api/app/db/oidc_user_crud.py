@@ -92,14 +92,14 @@ async def get_user_by_provider_sub(
     """Look up an existing user by their external-provider subject identifier.
 
     Returns a dict with ``{id, username, role, uri, auth_provider,
-    external_sub_id, dataset_id}`` or ``None`` if no match is found.
+    external_sub_id, status}`` or ``None`` if no match is found.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             SELECT id, username, role, uri, auth_provider, external_sub_id,
-                dataset_id
+                status
             FROM sensorthings."User"
             WHERE auth_provider = $1
               AND external_sub_id = $2
@@ -117,8 +117,7 @@ async def create_pending_oidc_user(
     email: str | None,
     auth_provider: str,
     external_sub_id: str,
-    dataset_id: str | None = None,
-    requested_role: str | None = None,
+    requested_networks: list | None = None,
 ) -> dict:
     """Insert a new OIDC-linked user in the 'pending' waiting room.
 
@@ -142,20 +141,16 @@ async def create_pending_oidc_user(
                          ``"orcid"``, ``"keycloak"``.
         external_sub_id: The ``sub`` claim from the provider's JWT — globally
                          unique within that provider's namespace.
-        dataset_id:      Name of the Network the user requested scoped access
-                         to before starting the OIDC handshake (see
-                         app.v1.endpoints.create.oidc_login), mirroring what
-                         POST /Register collects for local accounts. May be
-                         ``None``.
-        requested_role:  RBAC role the user asked to be granted, collected
-                         the same way as dataset_id (see oidc_login.py). An
-                         administrator reviewing the pending queue sees this
-                         as the default at approval time but can assign a
-                         different role — see update/admin_approval.py.
+        requested_networks: The grants the user asked for before starting the
+                         OIDC handshake (see oidc_login.py), in the same
+                         ``[{"network_name": [...], "role": ...}]`` shape
+                         POST /Register stores. A request only -- an
+                         administrator decides what is granted at approval
+                         time. May be ``None`` or empty.
 
     Returns:
         dict with keys ``id``, ``username``, ``role``, ``uri``,
-        ``auth_provider``, ``external_sub_id``, ``dataset_id``.
+        ``auth_provider``, ``external_sub_id``, ``requested_networks``.
         ``username`` reflects whichever candidate actually got inserted —
         the caller's ``username`` argument if it was free, or an
         auto-suffixed variant otherwise (see
@@ -221,20 +216,19 @@ async def create_pending_oidc_user(
                         """
                         INSERT INTO sensorthings."User"
                             (username, contact, role, status, auth_provider,
-                             external_sub_id, dataset_id,
-                             requested_role, possible_duplicate_of)
+                             external_sub_id, requested_networks,
+                             possible_duplicate_of)
                         VALUES
-                            ($1, $2::jsonb, $3, 'pending', $4, $5, $6, $7, $8)
+                            ($1, $2::jsonb, $3, 'pending', $4, $5, $6::jsonb, $7)
                         RETURNING id, username, role, uri, auth_provider,
-                            external_sub_id, dataset_id;
+                            external_sub_id, requested_networks;
                         """,
                         candidate,
                         contact,
                         PENDING_ROLE,  # hardcoded — never accept from caller
                         auth_provider,
                         external_sub_id,
-                        dataset_id,
-                        requested_role,
+                        _json.dumps(requested_networks or []),
                         possible_duplicate_of,
                     )
 
@@ -272,10 +266,10 @@ async def create_pending_oidc_user(
                         conn=conn,
                         action_type=AUDIT_ACTION_RESTRICTED_REQUEST,
                         actor_id=row["id"],
-                        dataset_id=dataset_id,
+                        network_name=requested_networks or [],
                         payload={
                             "auth_provider": auth_provider,
-                            "requested_role": requested_role,
+                            "requested_networks": requested_networks or [],
                         },
                     )
                 break

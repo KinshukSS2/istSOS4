@@ -18,43 +18,47 @@ Flow
 ----
 1.  Verify caller is an ``administrator`` (HTTP 403 otherwise).
 2.  Within a single DB transaction (write pool):
-    a.  Fetch the target user's row.
-    b.  UPDATE ``sensorthings."User"`` — set role and status='active'
-        WHERE id = user_id AND role = 'pending'.
-        RETURNING id; if no row returned → HTTP 404 (not found or not pending).
-    c.  Optionally set ``User.dataset_id`` (a Network name) to scope the user.
-    d.  Insert an ADMIN_APPROVAL audit event via ``log_audit_event``.
-3.  Return HTTP 200 with a confirmation payload.
+    a.  Lock and fetch the target user; it must still be ``pending`` (and
+        not rejected).
+    b.  Take the grants to give from the request: either the explicit
+        ``networks`` list, or -- when the administrator sends
+        ``approve_as_requested: true`` -- the applicant's own
+        ``requested_networks``. The request is only a hint: the administrator's
+        list replaces it.
+    c.  Validate and resolve them (Network names -> ids, policy names -> ids,
+        ambiguity, overlaps) and replace the user's grants.
+    d.  Mark the account ``active`` (``role='member'``).
+    e.  Insert an ADMIN_APPROVAL audit event.
+3.  Return HTTP 200 with the requested, granted and effective access.
 
 Architecture note
 -----------------
-This endpoint is the "Path B" counterpart to POST /Register.  The
-registration endpoint creates a pending user; this endpoint activates it.
-It also covers "Path A" (OIDC JIT-provisioned pending users) -- that path
-used to be served by its own POST /Users/{id}/activate endpoint, built
-independently for OIDC signups and doing the same job under different
-field names. The two had already drifted (activate logged auth_provider
-in its audit event; this one didn't, until that gap was closed). activate
-has been removed; this endpoint now covers both origins, resolving
-target_role from request.role if given, else the requested_role stated at
-registration or OIDC login.
+This is the single approval path for both local sign-ups (POST /Register)
+and OIDC JIT-provisioned accounts. Access is entirely grant-based: there is
+no per-approval RLS call, and the static policies created by migration
+017_network_grants.sql evaluate each user's grants on every query.
 
-No RLS call is made here — capability (what actions) is enforced by the
-static per-role policies created once by 006_session_scoped_rls_policies.sql.
-This endpoint only sets the role and, optionally, the network scope (which
-rows). Both are plain UPDATEs.
-
-The entire mutation runs inside one ``conn.transaction()`` block so any
-failure leaves the user still pending with no partial state.
+The whole mutation runs inside one ``conn.transaction()`` block, so a failure
+leaves the user still pending with no partial grants.
 """
 
+import json
 import logging
 
-from app import NETWORK, POSTGRES_PORT_WRITE
+from app import POSTGRES_PORT_WRITE
 from app.db.asyncpg_db import get_pool, get_pool_w
 from app.db.audit_crud import AUDIT_ACTION_ADMIN_APPROVAL, log_audit_event
+from app.db.network_grant_crud import (
+    effective_permissions,
+    grant_warnings,
+    render_grants,
+    replace_user_grants,
+    resolve_grants,
+)
 from app.models.approval_request import AdminApprovalRequest, ApprovalResponse
+from app.models.networks import GrantList
 from app.oauth import get_current_user
+from app.rbac_roles import MEMBER_ROLE
 from app.v1.endpoints.openapi_responses import (
     BAD_REQUEST_REJECTED,
     DB_TIMEOUT,
@@ -74,9 +78,12 @@ from asyncpg.exceptions import (
 )
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
+from pydantic import TypeAdapter, ValidationError
 
 v1 = APIRouter()
 logger = logging.getLogger(__name__)
+
+_GRANT_LIST = TypeAdapter(GrantList)
 
 
 @v1.api_route(
@@ -85,30 +92,49 @@ logger = logging.getLogger(__name__)
     tags=["Registration & Approval"],
     summary="Admin approval: activate a pending user",
     description=(
-        "Promote a pending user to an active role, optionally scoping them to "
-        "a Network. Covers both local self-registration (POST /Register) and "
-        "OIDC JIT-provisioned signups. The role is a plain UPDATE (RLS is "
-        "enforced by the static policies in 006_session_scoped_rls_policies.sql); "
-        "dataset, if given, is written to User.dataset_id and must match an "
-        "existing Network. Records an ADMIN_APPROVAL audit event in the same "
-        "transaction. Restricted to administrators; the target user must be "
-        "in the 'pending' state."
+        "Approve a pending account and give it its access. Covers both local "
+        "self-registration (POST /Register) and OIDC sign-ups.\n\n"
+        "Send **either** `networks` -- the final list of grants "
+        "(`network_name` list, `role`, `policy`), replacing whatever the "
+        "applicant requested -- **or** `approve_as_requested: true` to grant "
+        "exactly the request. `network_name: []` grants all Networks. "
+        "Grants add up: where several cover a Network the user holds the "
+        "union. Everything is saved in one transaction, with an "
+        "ADMIN_APPROVAL audit event. Restricted to administrators; the "
+        "target must be in the 'pending' state."
     ),
     status_code=status.HTTP_200_OK,
     responses=merge(
         {
             200: response(
                 ApprovalResponse,
-                "Approved. The role change, the optional network scope, and "
-                "the ADMIN_APPROVAL audit event are all written in one "
-                "transaction.",
+                "Approved. The grants, the account activation and the "
+                "ADMIN_APPROVAL audit event are written in one transaction.",
                 {
-                    "message": "User 'jdoe' (id=42) has been approved with role 'viewer'.",
+                    "message": "User 'jdoe' (id=42) has been approved.",
                     "user_id": 42,
-                    "granted_role": "viewer",
-                    "dataset_id": "IDROLOGIA",
+                    "username": "jdoe",
+                    "status": "active",
+                    "requested": [{"network_name": ["psos"], "role": "viewer"}],
+                    "granted": [
+                        {"network_name": ["psos"], "role": "viewer", "policy": ""}
+                    ],
+                    "effective": [{"network_name": "psos", "roles": ["viewer"]}],
+                    "warnings": [],
                 },
-            )
+            ),
+            400: {
+                "description": (
+                    "A grant is invalid: unknown or ambiguous Network name, "
+                    "unknown policy, overlapping grants of the same role, or "
+                    "`approve_as_requested` with nothing requested."
+                ),
+                "content": {
+                    "application/json": {
+                        "example": {"detail": "No Network named: 'nowhere'."}
+                    }
+                },
+            },
         },
         UNAUTHORIZED,
         {
@@ -149,33 +175,26 @@ async def patch_policy_approval(
         async with write_pool.acquire() as conn:
             async with conn.transaction():
 
-                # ------------------------------------------------------
-                # 2a. Fetch the target user's username and status.
-                #     We need the username to construct the RLS policy
-                #     name and pass as the first argument to the policy
-                #     function. status is checked separately below —
-                #     rejection is a status transition, not a role
-                #     change, so a rejected user still has role='pending'
-                #     and would otherwise still match the UPDATE's
-                #     WHERE clause in step 2b.
-                # ------------------------------------------------------
-                username_row = await conn.fetchrow(
+                # 2a. Lock the target. A rejected user still has
+                #     role='pending' (rejection is a status transition), so
+                #     status is checked separately.
+                target = await conn.fetchrow(
                     """
-                    SELECT username, status, requested_role, dataset_id,
-                        auth_provider
+                    SELECT username, status, role, requested_networks, auth_provider
                     FROM sensorthings."User"
                     WHERE id = $1
+                    FOR UPDATE
                     """,
                     user_id,
                 )
 
-                if username_row is None:
+                if target is None or target["role"] != "pending":
                     raise HTTPException(
                         status_code=status.HTTP_404_NOT_FOUND,
                         detail="User not found or not in pending state",
                     )
 
-                if username_row["status"] == "rejected":
+                if target["status"] == "rejected":
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=(
@@ -185,128 +204,94 @@ async def patch_policy_approval(
                         ),
                     )
 
-                username: str = username_row["username"]
+                username: str = target["username"]
+                requested_raw = target["requested_networks"]
+                requested = (
+                    json.loads(requested_raw)
+                    if isinstance(requested_raw, str)
+                    else (requested_raw or [])
+                )
 
-                # request.role is the administrator's explicit choice and
-                # always wins; omitting it falls back to what the
-                # applicant themselves asked for at registration or OIDC
-                # login. Both missing means there is nothing to approve
-                # into.
-                target_role = request.role or username_row["requested_role"]
-                if target_role is None:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=(
-                            f"User '{username}' did not request a role at "
-                            "registration, so role must be specified "
-                            "explicitly."
-                        ),
-                    )
+                # 2b. The grants to give.
+                if request.networks is not None:
+                    grants = request.networks
+                else:
+                    if not requested:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=(
+                                f"User '{username}' requested no access, so "
+                                "'networks' must be specified explicitly."
+                            ),
+                        )
+                    try:
+                        grants = _GRANT_LIST.validate_python(requested)
+                    except ValidationError:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=(
+                                "The stored request is not a valid grant "
+                                "list; specify 'networks' explicitly."
+                            ),
+                        )
 
-                # ------------------------------------------------------
-                # 2b. UPDATE the User row — role + status.
-                #     The WHERE clause includes role = 'pending' so we
-                #     only activate genuinely pending users; RETURNING id
-                #     confirms a row was touched.
-                # ------------------------------------------------------
-                updated_row = await conn.fetchrow(
+                # 2c. Resolve + save. admin=True: this is the administrator's
+                #     own decision, so a grant covering all Networks is fine.
+                resolved = await resolve_grants(conn, grants, admin=True)
+                await replace_user_grants(conn, user_id, resolved)
+
+                # 2d. Activate.
+                await conn.execute(
                     """
                     UPDATE sensorthings."User"
-                    SET role   = $1,
-                        status = 'active'
-                    WHERE id   = $2
-                      AND role = 'pending'
-                    RETURNING id
+                    SET role = $1, status = 'active'
+                    WHERE id = $2
                     """,
-                    target_role,
+                    MEMBER_ROLE,
                     user_id,
                 )
 
-                if updated_row is None:
-                    raise HTTPException(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        detail="User not found or not in pending state",
-                    )
+                granted = render_grants(resolved)
 
-                # ------------------------------------------------------
-                # 2c. Network scope. The role UPDATE above is the entire
-                #     capability grant (enforced by the static policies in
-                #     006_session_scoped_rls_policies.sql). This step only
-                #     sets *which rows* the user may touch, by writing a
-                #     Network name to User.dataset_id.
-                #
-                #     request.dataset: None  -> leave the applicant's
-                #       requested value unchanged.
-                #                     ""    -> clear any scope.
-                #                     name  -> must match a Network.
-                # ------------------------------------------------------
-                # With NETWORK=0 there are no Networks, so a requested scope is ignored.
-                granted_dataset_id = username_row["dataset_id"] if NETWORK else None
-                if NETWORK and request.dataset is not None:
-                    new_scope = request.dataset.strip() or None
-                    if new_scope is not None and NETWORK:
-                        exists = await conn.fetchval(
-                            'SELECT 1 FROM sensorthings."Network" WHERE name = $1',
-                            new_scope,
-                        )
-                        if not exists:
-                            raise HTTPException(
-                                status_code=status.HTTP_400_BAD_REQUEST,
-                                detail=(
-                                    f"No Network named '{new_scope}'. "
-                                    "dataset must match an existing Network."
-                                ),
-                            )
-                    await conn.execute(
-                        'UPDATE sensorthings."User" SET dataset_id = $1 WHERE id = $2',
-                        new_scope,
-                        user_id,
-                    )
-                    granted_dataset_id = new_scope
-
-                # ------------------------------------------------------
-                # 2d. Append an ADMIN_APPROVAL record to the AuditLog.
-                #     Same connection / same transaction → atomic with
-                #     the UPDATE above.
-                # ------------------------------------------------------
+                # 2e. Audit, same transaction.
                 await log_audit_event(
                     conn=conn,
                     action_type=AUDIT_ACTION_ADMIN_APPROVAL,
                     actor_id=current_user["id"],
-                    dataset_id=granted_dataset_id,
+                    network_name=granted,
                     payload={
                         "approved_user_id": user_id,
-                        "granted_role": target_role,
-                        "auth_provider": username_row["auth_provider"],
+                        "auth_provider": target["auth_provider"],
+                        "requested_networks": requested,
+                        "granted_networks": granted,
                     },
                 )
 
         logger.info(
-            "Admin approval: user '%s' (id=%d) granted role '%s' "
-            "scoped to '%s' by admin id=%d.",
+            "Admin approval: user '%s' (id=%d) granted %s by admin id=%d.",
             username,
             user_id,
-            target_role,
-            granted_dataset_id,
+            granted,
             current_user["id"],
         )
 
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={
-                "message": (
-                    f"User '{username}' (id={user_id}) has been approved "
-                    f"with role '{target_role}'."
-                ),
+                "message": f"User '{username}' (id={user_id}) has been approved.",
                 "user_id": user_id,
-                "granted_role": target_role,
-                "dataset_id": granted_dataset_id,
+                "username": username,
+                "status": "active",
+                "requested": requested,
+                "granted": granted,
+                "effective": effective_permissions(resolved),
+                "warnings": grant_warnings(resolved),
             },
         )
 
     except HTTPException:
         # Re-raise HTTPExceptions raised inside the transaction block
-        # (404s) without wrapping them in a 500.
+        # (404s, 400s) without wrapping them in a 500.
         raise
     except InsufficientPrivilegeError:
         return JSONResponse(

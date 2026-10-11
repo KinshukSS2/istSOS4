@@ -30,8 +30,9 @@ from app import (
     VERSION,
 )
 from app.db.asyncpg_db import get_pool
+from app.db.network_grant_crud import load_grants
 from app.db.redis_db import redis
-from app.rbac_roles import DELETED_STATUS, PENDING_ROLE
+from app.rbac_roles import DELETED_STATUS, MEMBER_ROLE, PENDING_ROLE
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jwt.exceptions import InvalidTokenError
@@ -57,6 +58,12 @@ oauth2_scheme_optional = OAuth2PasswordBearer(
 
 
 async def get_user_from_db(username: str):
+    """Load the account and, for members, their grants -- live, on every call.
+
+    ``role`` is the account kind: ``administrator``, ``pending`` or
+    ``member``. A member's access is the list in ``grants``; the value stored
+    in ``User.role`` for members is not used.
+    """
     pool = await get_pool()
     async with pool.acquire() as connection:
         query = """
@@ -65,15 +72,25 @@ async def get_user_from_db(username: str):
             WHERE username = $1
         """
         user_record = await connection.fetchrow(query, username)
-        if user_record is not None:
-            return {
-                "id": user_record["id"],
-                "username": user_record["username"],
-                "role": user_record["role"],
-                "uri": user_record["uri"],
-                "status": user_record["status"],
-            }
-    return None
+        if user_record is None:
+            return None
+
+        role = user_record["role"]
+        if role not in ("administrator", PENDING_ROLE):
+            role = MEMBER_ROLE
+        grants = []
+        if role == MEMBER_ROLE:
+            grants = (await load_grants(connection, [user_record["id"]]))[
+                user_record["id"]
+            ]
+        return {
+            "id": user_record["id"],
+            "username": user_record["username"],
+            "role": role,
+            "uri": user_record["uri"],
+            "status": user_record["status"],
+            "grants": grants,
+        }
 
 
 @asynccontextmanager
@@ -355,8 +372,9 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     except InvalidTokenError:
         raise credentials_exception
 
-    # NOTE: role is intentionally fetched live from the DB on every request.
-    # This ensures role changes (via PATCH /Users/{id}/role) take effect
+    # NOTE: role and grants are intentionally fetched live from the DB on
+    # every request. This ensures access changes (via PATCH
+    # /Users/{id}/networks) take effect
     # immediately without requiring JWT rotation, eliminating stale JWT
     # vulnerabilities.
     user = await get_user_from_db(username)

@@ -123,7 +123,8 @@ print(f"   (ground truth: that network has {ds_in_net} of {ds_total} datastreams
 
 before = len(fake_log_lines())
 s1 = requests.Session()
-r = roundtrip(s1, dataset_id=net_name, requested_role="viewer")
+r = roundtrip(s1, networks=json.dumps(
+    [{"network_name": [net_name], "role": "viewer"}]))
 print(f"\n   istSOS /callback -> HTTP {r.status_code}: {r.json().get('message')}")
 pause()
 
@@ -187,15 +188,15 @@ tok = requests.post(f"{BASE}/Login",
                     data={"username": "admin", "password": "admin"}).json()["access_token"]
 uid = psql("SELECT id FROM sensorthings.\"User\" "
            "WHERE auth_provider='google' AND external_sub_id='fake-sub-001'")
-row_before = psql(f'SELECT role, dataset_id FROM sensorthings."User" WHERE id={uid}')
-print(f"   before:  User {uid}  role|dataset = {row_before}")
+row_before = psql(f'SELECT role, status FROM sensorthings."User" WHERE id={uid}')
+print(f"   before:  User {uid}  role|status = {row_before}")
 a = requests.patch(f"{BASE}/Users/{uid}/policy-approval",
                   headers={"Authorization": f"Bearer {tok}"},
-                  json={"role": "viewer", "dataset": net_name})
-print(f"   PATCH /Users/{uid}/policy-approval {{role:viewer, dataset:{net_name}}} -> {a.status_code}: {a.json().get('message')}")
-row_after = psql(f'SELECT role, dataset_id FROM sensorthings."User" WHERE id={uid}')
-print(f"   after:   User {uid}  role|dataset = {row_after}")
-audit = psql("SELECT action_type, dataset_id FROM sensorthings.\"AuditLog\" "
+                  json={"networks": [{"network_name": [net_name], "role": "viewer"}]})
+print(f"   PATCH /Users/{uid}/policy-approval {{networks:[{{network_name:[{net_name}], role:viewer}}]}} -> {a.status_code}: {a.json().get('message')}")
+row_after = psql(f'SELECT role, status FROM sensorthings."User" WHERE id={uid}')
+print(f"   after:   User {uid}  role|status = {row_after}")
+audit = psql("SELECT action_type, network_name FROM sensorthings.\"AuditLog\" "
              f"WHERE (payload->>'approved_user_id')::bigint = {uid}")
 print(f"   audit log row: {audit}")
 pause()
@@ -210,7 +211,7 @@ print(f"\n   /callback -> HTTP {r.status_code}, access_token issued by istSOS:")
 print(f"      header {json.dumps(h)}")
 print(f"      claims {json.dumps(p)}")
 print("   sub is the username istSOS derived + sanitised from the OIDC")
-print("   email; role is what the admin granted. Same JWT shape /Login gives.")
+print("   email; access is what the admin granted. Same JWT shape /Login gives.")
 pause()
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from app import AUTHORIZATION, VERSIONING
+from app.db.network_grant_crud import fixed_commit_id, uses_fixed_commit
 from app.v1.endpoints.exceptions import BadRequest, Forbidden
 from app.v1.endpoints.functions import insert_commit
 
@@ -23,7 +24,7 @@ async def set_commit(
     if not (VERSIONING or AUTHORIZATION):
         return
 
-    if current_user and current_user["role"] == "sensor":
+    if current_user and uses_fixed_commit(current_user, "sensor"):
         if commit_message:
             raise Forbidden("Sensor cannot provide commit message")
         return

@@ -44,6 +44,36 @@ docker compose down -v
 docker compose up -d --build
 ```
 
+### Per-Network access (grants)
+
+A user does not have one role; they have a **list of grants**. Each grant is
+"these Networks, this role" (and a named policy for `custom`):
+
+```json
+"networks": [
+  {"network_name": ["psos", "acsot"], "role": "editor", "policy": ""},
+  {"network_name": [],                "role": "viewer", "policy": ""}
+]
+```
+
+`network_name: []` means every Network. Several roles on the same Network add
+up; only an administrator can save an all-Networks grant. The list is used by
+
+| Call | Meaning |
+|---|---|
+| `POST /Register`, `GET /auth/{provider}/login?networks=<json>` | a *request* |
+| `PATCH /Users/{id}/policy-approval` | the decision: `{"networks": [...]}` or `{"approve_as_requested": true}` |
+| `POST /Users` (admin) | create an active user with grants |
+| `PATCH /Users/{id}/networks` (admin) | replace a user's grants |
+| `POST /Policies` / `DELETE /Policies?policy=` | create / delete a named rule set for `custom` grants |
+
+**Upgrading an existing database.** The init scripts only run on an empty
+database. On an existing one, apply
+`database/migrations/017_network_grants.sql` (copies each user's old role and
+`dataset_id` into one grant, drops legacy per-user custom policies and lists
+them in `GrantMigrationReport`), check the report, then apply
+`018_drop_dataset_columns.sql`.
+
 ### External (OIDC) login
 
 Real Google, GitHub, Microsoft and ORCID sign-in needs your own client id and
@@ -64,7 +94,14 @@ python api/tests/e2e/run_gsoc_acceptance.py
 python api/tests/e2e/run_rls_leak_audit.py
 python api/tests/e2e/run_oidc_e2e.py
 python api/tests/e2e/run_auth_parity.py
+python api/tests/e2e/run_network_grants_e2e.py
 ```
+
+These scripts read ground truth from the database container
+(`DB_CONTAINER`, default `istsos4-database`) -- point it at a disposable stack
+if you run them against anything else. `run_grants_rls_audit.py` runs a
+rolled-back SQL audit of every role x operation and refuses to start without
+`DB_CONTAINER`.
 
 See `api/tests/e2e/README.md` for details.
 

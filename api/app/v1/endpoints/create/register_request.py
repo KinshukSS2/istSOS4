@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""POST /Register — Public self-registration for restricted dataset access.
+"""POST /Register — Public self-registration for access to chosen Networks.
 
 Flow
 ----
@@ -57,9 +57,10 @@ import asyncio
 import json
 import logging
 
-from app import NETWORK, POSTGRES_PORT_WRITE
+from app import POSTGRES_PORT_WRITE
 from app.db.asyncpg_db import get_pool, get_pool_w
 from app.db.audit_crud import AUDIT_ACTION_RESTRICTED_REQUEST, log_audit_event
+from app.db.network_grant_crud import normalise_requested, resolve_grants
 from app.db.password_crud import pwd_context
 from app.models.register_request import RegisterResponse, RestrictedRegistrationRequest
 from app.v1.endpoints.openapi_responses import (
@@ -147,8 +148,12 @@ async def register_request(request: RestrictedRegistrationRequest):
     contact_dict["explanation"] = request.explanation
     contact_json: str = json.dumps(contact_dict)
 
-    # With NETWORK=0 there are no Networks, so a requested scope is ignored.
-    dataset_id = request.dataset_id if NETWORK else None
+    # The request is a hint, never enforced: store it as submitted (policy
+    # dropped -- only an administrator assigns one). With NETWORK=0 the
+    # Network lists are ignored later, so they are kept as the applicant wrote
+    # them and the roles are what count.
+    requested = normalise_requested(request.networks)
+    requested_json: str = json.dumps(requested)
 
     # ------------------------------------------------------------------
     # 3. Acquire a write connection and execute all mutations atomically.
@@ -158,6 +163,12 @@ async def register_request(request: RestrictedRegistrationRequest):
 
         async with write_pool.acquire() as conn:
             async with conn.transaction():
+
+                # 3-pre. Reject unknown / ambiguous Network names now rather
+                #        than leave the administrator a request they cannot
+                #        approve. (admin=True only because an applicant may
+                #        *ask* for all Networks; nothing is stored here.)
+                await resolve_grants(conn, requested, admin=True)
 
                 # 3a. Check for an existing row with this username, locked
                 #     for the duration of the transaction so two concurrent
@@ -187,10 +198,10 @@ async def register_request(request: RestrictedRegistrationRequest):
 
                 if existing is not None:
                     # Re-application: overwrite the previously-rejected row.
-                    # Back to role='pending' / status='pending'; dataset_id
-                    # and requested_role are overwritten too -- a re-applying
-                    # user may request a different network/role than their
-                    # rejected attempt.
+                    # Back to role='pending' / status='pending'; the
+                    # requested networks are overwritten too -- a re-applying
+                    # user may ask for different access than their rejected
+                    # attempt.
                     row = await conn.fetchrow(
                         """
                         UPDATE sensorthings."User"
@@ -198,22 +209,20 @@ async def register_request(request: RestrictedRegistrationRequest):
                             contact         = $2::jsonb,
                             role            = 'pending',
                             status          = 'pending',
-                            dataset_id      = $3,
-                            requested_role  = $4
-                        WHERE id = $5
+                            requested_networks = $3::jsonb
+                        WHERE id = $4
                         RETURNING id
                         """,
                         hashed_password,
                         contact_json,
-                        dataset_id,
-                        request.requested_role,
+                        requested_json,
                         existing["id"],
                     )
                 else:
                     # 3a. INSERT the new User row.
                     #     role='pending' / status='pending' → not usable
-                    #     until an administrator approves. dataset_id and
-                    #     requested_role are persisted here (not just in the
+                    #     until an administrator approves. The requested
+                    #     networks are persisted here (not just in the
                     #     AuditLog) so an admin reviewing GET /Users sees
                     #     what was requested without a manual join.
                     #     The RETURNING clause gives us the auto-assigned PK.
@@ -221,16 +230,15 @@ async def register_request(request: RestrictedRegistrationRequest):
                         """
                         INSERT INTO sensorthings."User"
                             (username, password, role, status, contact,
-                             dataset_id, requested_role)
+                             requested_networks)
                         VALUES
-                            ($1, $2, 'pending', 'pending', $3::jsonb, $4, $5)
+                            ($1, $2, 'pending', 'pending', $3::jsonb, $4::jsonb)
                         RETURNING id
                         """,
                         request.username,
                         hashed_password,
                         contact_json,
-                        dataset_id,
-                        request.requested_role,
+                        requested_json,
                     )
                 new_user_id: int = row["id"]
 
@@ -252,20 +260,19 @@ async def register_request(request: RestrictedRegistrationRequest):
                     conn=conn,
                     action_type=AUDIT_ACTION_RESTRICTED_REQUEST,
                     actor_id=new_user_id,
-                    dataset_id=dataset_id,
+                    network_name=requested,
                     payload={
                         "explanation": request.explanation,
-                        "requested_role": request.requested_role,
+                        "requested_networks": requested,
                     },
                 )
 
         logger.info(
             "Restricted registration: new pending user '%s' (id=%d) "
-            "requested network '%s', role '%s'.",
+            "requested %s.",
             request.username,
             new_user_id,
-            dataset_id,
-            request.requested_role,
+            requested_json,
         )
 
         return JSONResponse(

@@ -47,9 +47,10 @@ ALLOWED_KEYS = [
     summary="Update a User",
     description=(
         "Update an existing user's contact info and/or uri, identified by "
-        "id -- consistent with every other /Users endpoint. A user's role "
-        "and Network scope are changed with `PATCH /Users/{user_id}/role`; "
-        "sending `role` here returns 400."
+        "id -- consistent with every other /Users endpoint. A user's access "
+        "(per-Network grants) is changed with "
+        "`PATCH /Users/{user_id}/networks`; sending `role` or `networks` "
+        "here returns 400."
     ),
     status_code=status.HTTP_200_OK,
     responses=merge(
@@ -72,7 +73,8 @@ ALLOWED_KEYS = [
             },
             400: {
                 "description": (
-                    "`role` in the payload (use `PATCH /Users/{user_id}/role`), "
+                    "`role` or `networks` in the payload (use "
+                    "`PATCH /Users/{user_id}/networks`), "
                     "an unrecognised payload key, or any other failure -- "
                     "the message is the raw exception text."
                 ),
@@ -115,13 +117,13 @@ async def update_user(
                 # per-user PostgreSQL roles, so a role change here used to hit
                 # a REVOKE/GRANT on a role that no longer exists. The role
                 # endpoint owns role and scope changes and their safeguards.
-                if "role" in payload:
+                if "role" in payload or "networks" in payload:
                     return JSONResponse(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         content={
                             "message": (
-                                "Use PATCH /Users/{user_id}/role to change "
-                                "a user's role."
+                                "Use PATCH /Users/{user_id}/networks to "
+                                "change a user's access."
                             )
                         },
                     )

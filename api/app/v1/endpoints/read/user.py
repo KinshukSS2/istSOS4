@@ -15,6 +15,7 @@
 import ujson
 from app import AUTHORIZATION
 from app.db.asyncpg_db import get_pool
+from app.db.network_grant_crud import load_grants, render_grants
 from app.rbac_roles import PENDING_ROLE
 from asyncpg.exceptions import InsufficientPrivilegeError
 from fastapi import APIRouter, Depends, status
@@ -53,6 +54,20 @@ if AUTHORIZATION:
                                 "username": "admin",
                                 "role": "administrator",
                                 "status": "active",
+                                "networks": [],
+                            },
+                            {
+                                "id": 2,
+                                "username": "jdoe",
+                                "role": "member",
+                                "status": "active",
+                                "networks": [
+                                    {
+                                        "network_name": ["psos"],
+                                        "role": "viewer",
+                                        "policy": "",
+                                    }
+                                ],
                             }
                         ]
                     }
@@ -101,6 +116,9 @@ async def get_users(
                 # `password`/`status`/... never ran; the secret column is
                 # stripped here instead.
                 #
+                # `networks` is the user's saved grants; `requested_networks`
+                # (stored on the row) is what a pending applicant asked for.
+                #
                 # `role` is reported as null for a not-yet-approved account.
                 # In the DB the column holds the sentinel 'pending' -- an
                 # internal, zero-privilege, non-RBAC value that every auth
@@ -108,20 +126,31 @@ async def get_users(
                 # `WHERE role = 'pending'` approve/reject guards, the RLS
                 # "matches no policy" fail-close). Surfacing that literally,
                 # next to status:'pending' / status:'rejected', misreads as
-                # "their role is pending". `requested_role` already carries
-                # what the applicant asked for. Active users are untouched.
+                # "their role is pending". `requested_networks` already
+                # carries what the applicant asked for.
+                parsed = [ujson.loads(record["users"]) for record in users]
+                try:
+                    grants_by_user = await load_grants(
+                        connection, [row["id"] for row in parsed]
+                    )
+                except Exception:
+                    # AUTHORIZATION=0 databases never ran the grant migration.
+                    grants_by_user = {}
+
                 cleaned = []
-                for record in users:
+                for full_row in parsed:
                     row = {
                         key: value
-                        for key, value in ujson.loads(record["users"]).items()
+                        for key, value in full_row.items()
                         if key != "password"
                     }
                     if row.get("role") == PENDING_ROLE:
                         row["role"] = None
+                    row["networks"] = render_grants(
+                        grants_by_user.get(row["id"], [])
+                    )
                     cleaned.append(row)
                 users = cleaned
-
 
                 return JSONResponse(
                     status_code=status.HTTP_200_OK,

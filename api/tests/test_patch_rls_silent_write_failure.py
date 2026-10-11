@@ -24,12 +24,12 @@ session to reproduce.
 
 update_entity() (api/app/v1/endpoints/update/functions.py) now returns
 True/False for whether the UPDATE actually matched a row (obs=False path)
-or the RETURNING row / None (obs=True). A viewer role shares Thing's
-SELECT policy with editor (rbac_user_select_thing, USING (TRUE)) but not
-its write policy (rbac_editor_write_thing, USING (current_app_user_role()
-= 'editor')) -- so a viewer session can see a Thing but not write it,
-which is exactly the "check_id_exists succeeds, the UPDATE silently
-touches zero rows" scenario the bug was about.
+or the RETURNING row / None (obs=True). A member holding only a
+viewer grant shares Thing's SELECT policy with an editor
+(rbac_thing_select) but not its write policy (rbac_thing_editor, which
+needs an editor / obs_manager grant) -- so a viewer session can see a
+Thing but not write it, which is exactly the "check_id_exists succeeds,
+the UPDATE silently touches zero rows" scenario the bug was about.
 
 Same rollback-only setup/connection pattern as test_rls_enforcement.py,
 for the same reason: a real cleanup DELETE on sensorthings."User" is
@@ -83,25 +83,33 @@ async def _connect_or_skip():
 
 
 async def _seed(connection):
-    """A viewer, an editor, and a Thing row -- both roles can SELECT it
-    (rbac_user_select_thing has no dataset scoping), only editor can
-    write it (rbac_editor_write_thing)."""
+    """A viewer member, an editor member, and a Thing row -- both can
+    SELECT it, only the editor grant can write it."""
     await set_role(connection, {"role": "administrator"})
 
     viewer_id = await connection.fetchval(
         """
-        INSERT INTO sensorthings."User" (username, role)
-        VALUES ($1, 'viewer') RETURNING id;
+        INSERT INTO sensorthings."User" (username, role, status)
+        VALUES ($1, 'member', 'active') RETURNING id;
         """,
         f"{_MARKER}_viewer",
     )
     editor_id = await connection.fetchval(
         """
-        INSERT INTO sensorthings."User" (username, role)
-        VALUES ($1, 'editor') RETURNING id;
+        INSERT INTO sensorthings."User" (username, role, status)
+        VALUES ($1, 'member', 'active') RETURNING id;
         """,
         f"{_MARKER}_editor",
     )
+    for uid, role in ((viewer_id, "viewer"), (editor_id, "editor")):
+        await connection.execute(
+            """
+            INSERT INTO sensorthings."UserGrant" ("user_id", "role", "all_networks")
+            VALUES ($1, $2, true);
+            """,
+            uid,
+            role,
+        )
     commit_id = await connection.fetchval(
         """
         INSERT INTO sensorthings."Commit" (message, author, "encodingType", "actionType", user_id)
@@ -133,7 +141,7 @@ def test_viewer_patch_is_rejected_not_silently_dropped():
                 viewer_id, _editor_id, thing_id = await _seed(connection)
 
                 async with connection.transaction():
-                    await set_role(connection, {"role": "viewer", "id": viewer_id})
+                    await set_role(connection, {"role": "member", "id": viewer_id})
 
                     # Sanity: viewer really can see the row (this is the
                     # exact precondition that made the bug possible --
@@ -186,7 +194,7 @@ def test_editor_patch_succeeds():
                 _viewer_id, editor_id, thing_id = await _seed(connection)
 
                 async with connection.transaction():
-                    await set_role(connection, {"role": "editor", "id": editor_id})
+                    await set_role(connection, {"role": "member", "id": editor_id})
                     result = await update_thing_entity(
                         connection, thing_id, {"description": "editor was here"}
                     )
@@ -223,7 +231,7 @@ def test_association_only_patch_returns_none_not_false():
                 _viewer_id, editor_id, thing_id = await _seed(connection)
 
                 async with connection.transaction():
-                    await set_role(connection, {"role": "editor", "id": editor_id})
+                    await set_role(connection, {"role": "member", "id": editor_id})
                     result = await update_thing_entity(connection, thing_id, {})
 
                 assert result is None

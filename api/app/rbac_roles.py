@@ -16,6 +16,10 @@ VALID_RBAC_ROLES = {
 # Users in this state have NO PostgreSQL database role (zero DB footprint).
 PENDING_ROLE = "pending"
 
+# Account kind of every active non-administrator user. Their access comes only
+# from their grants (sensorthings."UserGrant"); this is not an assignable role.
+MEMBER_ROLE = "member"
+
 # ---------------------------------------------------------------------------
 # sensorthings."User".status -- account lifecycle, an unconstrained
 # VARCHAR(50). One of:
@@ -38,6 +42,9 @@ DELETED_STATUS = "deleted"
 # Maps each assignable RBAC role to its underlying PostgreSQL group role.
 # Pending users are excluded — they receive no DB role until activated.
 DB_ROLE_BY_RBAC_ROLE = {
+    # every member runs as the "user" group; RLS + column-limit triggers
+    # decide per grant what they may do (see 017_network_grants.sql)
+    "member": "user",
     "viewer": "user",
     "editor": "user",
     "obs_manager": "sensor",
@@ -85,7 +92,7 @@ def get_db_role_for_rbac(role: str) -> str:
 
 
 # Sorted, JSON-serialisable view of the assignable roles, for OpenAPI
-# schemas only (see app/models/role.py, app/models/approval_request.py).
+# schemas only (see app/models/networks.py, app/models/approval_request.py).
 # Derived from VALID_RBAC_ROLES rather than duplicated, so the documented
 # enum can never drift from what validate_rbac_role() actually accepts.
 ASSIGNABLE_ROLES = sorted(VALID_RBAC_ROLES)

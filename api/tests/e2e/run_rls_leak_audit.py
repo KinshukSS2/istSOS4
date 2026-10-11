@@ -123,11 +123,12 @@ def main():
         requests.post(f"{BASE}/Register", timeout=20, json={
             "username": u, "password": PW,
             "contact_info": {"email": f"{u}@x.org"},
-            "explanation": "leak audit", "dataset_id": net_a,
-            "requested_role": role})
+            "explanation": "leak audit",
+            "networks": [{"network_name": [net_a], "role": role}]})
         uid = psql(f"SELECT id FROM sensorthings.\"User\" WHERE username='{u}'")
         requests.patch(f"{BASE}/Users/{uid}/policy-approval", headers=A,
-                       json={"role": role, "dataset": net_a}, timeout=20)
+                       json={"networks": [{"network_name": [net_a], "role": role}]},
+                       timeout=20)
         r = requests.post(f"{BASE}/Login", data={"username": u, "password": PW}, timeout=15)
         return r.json().get("access_token"), uid
 
@@ -311,7 +312,8 @@ def main():
     # and an UNSCOPED (global) editor keeps full write on shared refs
     gu = f"leak_global_ed_{TAG}"
     requests.post(f"{BASE}/Users", headers=A, timeout=20,
-                  json={"username": gu, "password": PW, "role": "editor"})
+                  json={"username": gu, "password": PW,
+                        "networks": [{"network_name": [], "role": "editor"}]})
     gt = requests.post(f"{BASE}/Login", data={"username": gu, "password": PW},
                        timeout=15).json().get("access_token")
     if b_sensor_excl and gt:

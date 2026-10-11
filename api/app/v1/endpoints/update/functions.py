@@ -15,6 +15,7 @@
 import json
 
 from app import AUTHORIZATION, NETWORK, VERSIONING
+from app.db.network_grant_crud import fixed_commit_id, uses_fixed_commit
 from app.utils.utils import (
     handle_associations,
     handle_datetime_fields,
@@ -38,17 +39,11 @@ async def set_commit(connection, commit_message, current_user):
     if not (VERSIONING or AUTHORIZATION):
         return None
 
-    if current_user and current_user["role"] == "qc":
+    if current_user and uses_fixed_commit(current_user, "qc"):
         if commit_message:
             raise Forbidden("QC user cannot provide commit message")
 
-        return await connection.fetchval(
-            """
-                SELECT id FROM sensorthings."Commit"
-                WHERE user_id = $1::bigint
-            """,
-            current_user["id"],
-        )
+        return await fixed_commit_id(connection, current_user, "UPDATE")
 
     if not commit_message:
         raise BadRequest("No commit message provided")

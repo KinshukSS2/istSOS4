@@ -106,9 +106,9 @@ if AUTHORIZATION:
                 "Obtain, refresh, and revoke bearer tokens for **local** "
                 "accounts.\n\n"
                 "`POST /Login` is the URL behind the **Authorize** button "
-                "above. Tokens carry `sub` and `role`, but the role is "
-                "re-read from the database on every request, so an "
-                "administrator's role change takes effect immediately "
+                "above. Tokens identify the user only: the user's Network "
+                "grants are re-read from the database on every request, so "
+                "an administrator's change takes effect immediately "
                 "without the token being reissued.\n\n"
                 "Revoking a token via `POST /Logout` requires `REDIS=1` on "
                 "this deployment; without Redis, `/Logout` still succeeds "
@@ -142,11 +142,11 @@ if AUTHORIZATION:
         },
         {
             "name": "Users",
-            "description": "User accounts, credentials, and role assignment.",
+            "description": "User accounts, credentials, and per-Network access grants.",
         },
         {
             "name": "Policies",
-            "description": "Row-level-security policies for the SensorThings API.",
+            "description": "Named rule sets (custom policies) a `custom` grant can point to.",
         },
     ]
 else:
@@ -246,7 +246,7 @@ if AUTHORIZATION:
     v1.include_router(register_request.v1)  # POST /Register  (public)
     v1.include_router(update_user.v1)
     v1.include_router(update_password.v1)  # PATCH /Users/{id}/password
-    v1.include_router(update_role.v1)      # PATCH /Users/{id}/role
+    v1.include_router(update_role.v1)      # PATCH /Users/{id}/networks
     v1.include_router(admin_approval.v1)   # PATCH /Users/{id}/policy-approval
     v1.include_router(admin_rejection.v1)  # PATCH /Users/{id}/reject
     v1.include_router(delete_user.v1)

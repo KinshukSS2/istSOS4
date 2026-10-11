@@ -43,7 +43,7 @@ row-level security, the audit trail — actually live.*
    `ANONYMOUS_VIEWER=0` (the default) a request with no token is rejected
    with 401. With `ANONYMOUS_VIEWER=1` a read with no token runs as the
    PostgreSQL `guest` role (shared reference data only), a read with a
-   valid token runs as that user, with their role and Network scope, and a
+   valid token runs as that user, with their per-Network grants, and a
    read with an invalid token is rejected with 401.
 
 ---
@@ -56,7 +56,7 @@ Access is staged, not binary. No path skips a stage.
 |:--|:--|:--|
 | **guest** | no token at all, and only when `ANONYMOUS_VIEWER=1` | read-only, and only the shared reference data (Things, Sensors, Locations, ObservedProperties, HistoricalLocations, FeaturesOfInterest); Datastreams, Observations and Networks are not visible |
 | **pending** | `POST /Register`, or a first-time login via `GET /auth/{provider}/login` | nothing — every authenticated route returns 403 |
-| **approved** | an administrator calls `PATCH /Users/{id}/policy-approval` | whatever the granted RBAC role and row-level-security policy allow |
+| **approved** | an administrator calls `PATCH /Users/{id}/policy-approval` | whatever the granted per-Network roles (and custom policies) allow |
 | **rejected** | an administrator calls `PATCH /Users/{id}/reject` | nothing, permanently, unless the applicant re-registers |
 
 Registering and logging in via an external identity provider are both
@@ -65,30 +65,52 @@ itself. An administrator always makes the decision.
 
 ---
 
-### RBAC roles
+### Per-Network grants
 
-Assignable: `viewer` &nbsp;·&nbsp; `editor` &nbsp;·&nbsp; `obs_manager` &nbsp;·&nbsp; `sensor` &nbsp;·&nbsp; `qc` &nbsp;·&nbsp; `custom`
+A user's access is a **list of grants**. Each grant says which Networks it
+covers, which role the user has there, and (for `custom` only) which named
+policy applies:
 
-`administrator` is deliberately **not** assignable through this API at
-all — promotion to admin is infrastructure/DBA-only, and the last
-remaining administrator can never be demoted (`PATCH /Users/{id}/role`
-returns `409`). `pending` is an internal state and can never be set
-directly by a caller.
+```json
+"networks": [
+  {"network_name": ["psos", "acsot"], "role": "editor", "policy": ""},
+  {"network_name": [],                "role": "viewer", "policy": ""}
+]
+```
+
+* `network_name: []` means **every** Network. Only an administrator can
+  save it; an applicant asking for it is only making a request.
+* Roles: `viewer` &nbsp;·&nbsp; `editor` &nbsp;·&nbsp; `obs_manager` &nbsp;·&nbsp; `sensor` &nbsp;·&nbsp; `qc` &nbsp;·&nbsp; `custom`.
+* The same Network under two roles **adds up**; two grants of the same role
+  must not overlap (400).
+* `policy` is only for `custom` — the name of a rule set created with
+  `POST /Policies`. A policy cannot be deleted while a grant uses it.
+* A `sensor` / `qc` user commits under a fixed commit and sends no commit
+  message — unless they also hold an `editor`, `obs_manager` or `custom`
+  grant, in which case every write carries a normal commit message.
+
+Where grants are set: `POST /Register` / `GET /auth/{provider}/login?networks=`
+(a *request*), `PATCH /Users/{id}/policy-approval` (the decision),
+`POST /Users` and `PATCH /Users/{id}/networks` (administrator).
+
+`administrator` is deliberately **not** a grantable role — promotion to
+admin is infrastructure/DBA-only, and the last remaining administrator can
+never be demoted (`PATCH /Users/{id}/networks` returns `409`). `pending` is
+an internal state and can never be set directly by a caller.
 
 ---
 
 ### Row-level security
 
 istSOS users are not PostgreSQL roles. The backend connects as one service
-account; per request it runs `SET LOCAL ROLE <group>` (`user` / `sensor` /
-`qc`) and stamps `app.current_user_id`. PostgreSQL row-level security then
-filters using the static per-role policies created once by
-`006_session_scoped_rls_policies.sql` — enforcement happens **inside the
-database**, not in Python.
+account; per request it runs `SET LOCAL ROLE "user"` and stamps
+`app.current_user_id`. The row-level-security policies created by
+`017_network_grants.sql` then look up that user's grants and filter rows
+accordingly — enforcement happens **inside the database**, not in Python.
 
-`custom` maps to the `user` group and gets the standard read access. A
-narrower, hand-written rule for a specific user is added separately via
-`POST /Policies` with `permissions.type = "custom"`.
+A `custom` grant has no blanket access: it only allows what the rules of
+its named policy (`POST /Policies`) allow, and only inside the grant's
+Networks.
 
 ---
 

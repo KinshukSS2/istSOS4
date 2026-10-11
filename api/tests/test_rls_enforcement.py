@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Regression coverage for 006_session_scoped_rls_policies.sql.
+"""Regression coverage for the grant-based RLS policies
+(017_network_grants.sql; the session-variable design is from
+006_session_scoped_rls_policies.sql).
 
 Every other RLS-adjacent test in this suite mocks the database connection
 entirely, so none of them can actually prove row-level security enforces
@@ -109,27 +111,15 @@ async def _connect_or_skip():
         pytest.skip(f"no reachable database for RLS enforcement test: {exc}")
 
 
-async def _seed(connection):
-    """Two viewer users, each scoped to a different real Network, plus one
-    existing Datastream from each of those Networks.
-
-    A user's scope is the Network *name* held in User.dataset_id; the RLS
-    policies resolve it through current_app_user_network_id(). No Datastream
-    is inserted -- the seed data already has rows in several Networks, and
-    reusing them avoids faking every NOT NULL FK.
-
-    Switches to the administrator PG role first, same as every real
-    privileged write in this codebase.
-    """
-    await set_role(connection, {"role": "administrator"})
-
+async def _networks(connection):
+    """Two Networks that each have a Datastream: [(network_id, name, ds_id)]."""
     nets = await connection.fetch(
         """
-        SELECT n.name, min(d.id) AS ds_id
+        SELECT n.id, n.name, min(d.id) AS ds_id
         FROM sensorthings."Network" n
         JOIN sensorthings."Datastream" d ON d.network_id = n.id
-        GROUP BY n.name
-        ORDER BY n.name
+        GROUP BY n.id, n.name
+        ORDER BY n.id
         LIMIT 2;
         """
     )
@@ -138,84 +128,180 @@ async def _seed(connection):
             "need two Networks that each have a Datastream -- run dummy_data "
             "with NETWORK=1"
         )
-    (net_a, ds_a), (net_b, ds_b) = (
-        (nets[0]["name"], nets[0]["ds_id"]),
-        (nets[1]["name"], nets[1]["ds_id"]),
-    )
+    return [(r["id"], r["name"], r["ds_id"]) for r in nets]
 
-    user_a = await connection.fetchval(
+
+async def _member(connection, label, grants):
+    """An active member holding ``grants``: a list of
+    (role, [network_id, ...]) -- an empty id list means ALL Networks."""
+    user_id = await connection.fetchval(
         """
-        INSERT INTO sensorthings."User" (username, role, dataset_id)
-        VALUES ($1, 'viewer', $2) RETURNING id;
+        INSERT INTO sensorthings."User" (username, role, status)
+        VALUES ($1, 'member', 'active') RETURNING id;
         """,
-        f"{_MARKER}_alice",
-        net_a,
+        f"{_MARKER}_{label}",
     )
-    user_b = await connection.fetchval(
-        """
-        INSERT INTO sensorthings."User" (username, role, dataset_id)
-        VALUES ($1, 'viewer', $2) RETURNING id;
-        """,
-        f"{_MARKER}_bob",
-        net_b,
-    )
-    return user_a, user_b, ds_a, ds_b
+    for role, network_ids in grants:
+        grant_id = await connection.fetchval(
+            """
+            INSERT INTO sensorthings."UserGrant" ("user_id", "role", "all_networks")
+            VALUES ($1, $2, $3) RETURNING id;
+            """,
+            user_id,
+            role,
+            not network_ids,
+        )
+        for network_id in network_ids:
+            await connection.execute(
+                """
+                INSERT INTO sensorthings."UserGrantNetwork" ("grant_id", "network_id")
+                VALUES ($1, $2);
+                """,
+                grant_id,
+                network_id,
+            )
+    return user_id
 
 
-def test_datastream_rls_filters_by_network_per_user():
+async def _visible_datastreams(connection, user_id, ids):
+    """Datastream ids from ``ids`` the member can SELECT -- in its own
+    nested transaction, like set_role() once per real request."""
+    async with connection.transaction():
+        await set_role(connection, {"role": "member", "id": user_id})
+        rows = await connection.fetch(
+            'SELECT id FROM sensorthings."Datastream" '
+            "WHERE id = ANY($1::bigint[]);",
+            list(ids),
+        )
+    return {r["id"] for r in rows}
+
+
+async def _can_update_datastream(connection, user_id, ds_id):
+    async with connection.transaction():
+        await set_role(connection, {"role": "member", "id": user_id})
+        updated = await connection.fetch(
+            'UPDATE sensorthings."Datastream" SET description = description '
+            "WHERE id = $1 RETURNING id;",
+            ds_id,
+        )
+    return bool(updated)
+
+
+def _in_rollback_only_transaction(coro_fn):
     async def _run():
         connection = await _connect_or_skip()
         try:
             transaction = connection.transaction()
             await transaction.start()
             try:
-                user_a, user_b, ds_a, ds_b = await _seed(connection)
-
-                # Nested transaction (asyncpg issues a SAVEPOINT here,
-                # since one is already open) so each SET LOCAL ROLE gets
-                # its own boundary, exactly like set_role() being called
-                # once per real request -- but all inside the same outer
-                # transaction, so a single ROLLBACK at the end undoes
-                # everything without ever needing DELETE.
-                async with connection.transaction():
-                    await set_role(connection, {"role": "viewer", "id": user_a})
-                    visible = await connection.fetch(
-                        'SELECT id FROM sensorthings."Datastream" '
-                        "WHERE id = ANY($1::bigint[]);",
-                        [ds_a, ds_b],
-                    )
-                    visible_ids = {r["id"] for r in visible}
-
-                assert visible_ids == {ds_a}, (
-                    "viewer session for user_a must see only its own "
-                    f"Network's Datastream ({ds_a}), not {ds_b} -- got "
-                    f"{visible_ids}. If this includes both ids, per-Network "
-                    "filtering has broken; if it's empty, the static "
-                    "policy itself stopped matching."
-                )
-
-                async with connection.transaction():
-                    await set_role(connection, {"role": "viewer", "id": user_b})
-                    visible = await connection.fetch(
-                        'SELECT id FROM sensorthings."Datastream" '
-                        "WHERE id = ANY($1::bigint[]);",
-                        [ds_a, ds_b],
-                    )
-                    visible_ids = {r["id"] for r in visible}
-
-                assert visible_ids == {ds_b}, (
-                    f"viewer session for user_b must see only {ds_b}, not "
-                    f"{ds_a} -- got {visible_ids}. Two users sharing the "
-                    "same PostgreSQL group role ('user') seeing each "
-                    "other's rows is exactly the bug "
-                    "006_session_scoped_rls_policies.sql fixed."
-                )
+                await set_role(connection, {"role": "administrator"})
+                await coro_fn(connection)
             finally:
                 await transaction.rollback()
         finally:
             await connection.close()
 
     asyncio.run(_run())
+
+
+def test_datastream_rls_filters_by_network_per_user():
+    """Two members share the PostgreSQL group role "user" but hold grants on
+    different Networks, so each sees only their own Network's rows."""
+
+    async def _body(connection):
+        (net_a, _, ds_a), (net_b, _, ds_b) = await _networks(connection)
+        user_a = await _member(connection, "alice", [("viewer", [net_a])])
+        user_b = await _member(connection, "bob", [("viewer", [net_b])])
+
+        assert await _visible_datastreams(connection, user_a, [ds_a, ds_b]) == {ds_a}
+        assert await _visible_datastreams(connection, user_b, [ds_a, ds_b]) == {ds_b}
+
+    _in_rollback_only_transaction(_body)
+
+
+def test_one_user_viewer_on_a_editor_on_b():
+    """Roles are per Network: viewer of A + editor of B reads both but may
+    write only B."""
+
+    async def _body(connection):
+        (net_a, _, ds_a), (net_b, _, ds_b) = await _networks(connection)
+        user = await _member(
+            connection, "mixed", [("viewer", [net_a]), ("editor", [net_b])]
+        )
+
+        assert await _visible_datastreams(connection, user, [ds_a, ds_b]) == {ds_a, ds_b}
+        assert not await _can_update_datastream(connection, user, ds_a)
+        assert await _can_update_datastream(connection, user, ds_b)
+
+    _in_rollback_only_transaction(_body)
+
+
+def test_empty_network_list_means_all_networks():
+    async def _body(connection):
+        (_, _, ds_a), (_, _, ds_b) = await _networks(connection)
+        user = await _member(connection, "everywhere", [("viewer", [])])
+
+        assert await _visible_datastreams(connection, user, [ds_a, ds_b]) == {ds_a, ds_b}
+        assert not await _can_update_datastream(connection, user, ds_a)
+
+    _in_rollback_only_transaction(_body)
+
+
+def test_same_network_two_roles_add_up():
+    """viewer + editor on the same Network -> the union (can write)."""
+
+    async def _body(connection):
+        (net_a, _, ds_a), (_, _, ds_b) = await _networks(connection)
+        user = await _member(
+            connection, "union", [("viewer", [net_a]), ("editor", [net_a])]
+        )
+
+        assert await _visible_datastreams(connection, user, [ds_a, ds_b]) == {ds_a}
+        assert await _can_update_datastream(connection, user, ds_a)
+
+    _in_rollback_only_transaction(_body)
+
+
+def test_user_without_grants_sees_nothing():
+    async def _body(connection):
+        (_, _, ds_a), (_, _, ds_b) = await _networks(connection)
+        user = await _member(connection, "nobody", [])
+
+        assert await _visible_datastreams(connection, user, [ds_a, ds_b]) == set()
+
+    _in_rollback_only_transaction(_body)
+
+
+def test_removing_a_grant_removes_access():
+    async def _body(connection):
+        (net_a, _, ds_a), (_, _, ds_b) = await _networks(connection)
+        user = await _member(connection, "revoked", [("viewer", [net_a])])
+        assert await _visible_datastreams(connection, user, [ds_a, ds_b]) == {ds_a}
+
+        # SET LOCAL ROLE outlives the nested transaction; switch back.
+        await set_role(connection, {"role": "administrator"})
+        await connection.execute(
+            'DELETE FROM sensorthings."UserGrant" WHERE "user_id" = $1', user
+        )
+        assert await _visible_datastreams(connection, user, [ds_a, ds_b]) == set()
+
+    _in_rollback_only_transaction(_body)
+
+
+def test_deleting_a_network_never_widens_to_all():
+    """A grant whose only Network is deleted must not turn into an
+    all-Networks grant."""
+
+    async def _body(connection):
+        (net_a, _, ds_a), (net_b, _, ds_b) = await _networks(connection)
+        user = await _member(connection, "pruned", [("viewer", [net_a])])
+        await connection.execute(
+            'DELETE FROM sensorthings."UserGrantNetwork" WHERE "network_id" = $1',
+            net_a,
+        )
+        assert await _visible_datastreams(connection, user, [ds_a, ds_b]) == set()
+
+    _in_rollback_only_transaction(_body)
 
 
 def test_static_policies_are_group_scoped_not_per_user():

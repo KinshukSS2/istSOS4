@@ -46,7 +46,9 @@ async def set_role(connection, current_user):
 
     Maps the application-layer role (e.g. 'viewer', 'editor') to its
     underlying PostgreSQL group role (e.g. 'user', 'sensor') using
-    ``DB_ROLE_BY_RBAC_ROLE``.
+    ``DB_ROLE_BY_RBAC_ROLE``. Every member (whatever their grants) runs as
+    the shared "user" group role; what they can see or change is decided by
+    their grants.
 
     Uses ``SET LOCAL ROLE`` which is **transaction-scoped**: it auto-reverts
     when the enclosing transaction commits or rolls back.  This eliminates
@@ -56,11 +58,8 @@ async def set_role(connection, current_user):
     Also sets the ``app.current_user_id`` session variable via
     ``set_config(..., is_local=true)`` — same transaction-scoped lifetime
     as the role switch. The RLS policies in
-    006_session_scoped_rls_policies.sql read it back (via
-    current_app_user_role() / current_app_user_network_id()) to tell
-    individual callers apart even though several application roles share
-    one PostgreSQL group role — e.g. 'viewer' and 'editor' both run as
-    "user" — and to apply each user's Network scope.
+    017_network_grants.sql policies read it back (via the app_* helper
+    functions) to look up the caller's grants and apply each Network scope.
 
     Must be called **inside** an open ``connection.transaction()`` block.
     """

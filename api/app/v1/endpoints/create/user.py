@@ -16,15 +16,23 @@ import asyncio
 import json
 import logging
 
-from app import HOSTNAME, NETWORK, POSTGRES_PORT_WRITE, SUBPATH, VERSION
+from app import HOSTNAME, POSTGRES_PORT_WRITE, SUBPATH, VERSION
 from app.db.asyncpg_db import get_pool, get_pool_w
 from app.db.audit_crud import AUDIT_ACTION_USER_CREATED, log_audit_event
+from app.db.network_grant_crud import (
+    effective_permissions,
+    grant_warnings,
+    render_grants,
+    replace_user_grants,
+    resolve_grants,
+)
 from app.db.password_crud import pwd_context
+from app.models.networks import GrantList
 from app.oauth import get_current_user
-from app.rbac_roles import validate_rbac_role
+from app.rbac_roles import MEMBER_ROLE
 from app.utils.utils import validate_username
 from app.validators import validate_password_strength
-from app.v1.endpoints.functions import insert_commit, set_role
+from app.v1.endpoints.functions import set_role
 from app.v1.endpoints.openapi_responses import (
     DB_TIMEOUT,
     DB_UNAVAILABLE,
@@ -38,18 +46,26 @@ from asyncpg.exceptions import (
     TooManyConnectionsError,
     UniqueViolationError,
 )
-from fastapi import APIRouter, Body, Depends, status
+from fastapi import APIRouter, Body, Depends, HTTPException, status
 from fastapi.responses import JSONResponse, Response
+from pydantic import TypeAdapter, ValidationError
 
 v1 = APIRouter()
 logger = logging.getLogger(__name__)
 
 PAYLOAD_EXAMPLE = {
     "username": "cp1",
-    "password": "qwertz",
+    "password": "Str0ng!Pass",
     "uri": "https://orcid.org/0000-0004-3456-7890",
-    "role": "viewer",  # viewer, editor, obs_manager, sensor, qc, custom
+    # the user's access: one grant per entry; network_name [] = all Networks
+    "networks": [
+        {"network_name": [], "role": "viewer", "policy": ""},
+        {"network_name": ["psos", "acsot"], "role": "custom", "policy": "policyname1"},
+    ],
 }
+
+_GRANT_LIST = TypeAdapter(GrantList)
+_ALLOWED_KEYS = {"username", "password", "networks", "uri", "contact"}
 
 @v1.api_route(
     "/Users",
@@ -57,11 +73,11 @@ PAYLOAD_EXAMPLE = {
     tags=["Users"],
     summary="Create a new User",
     description=(
-        "Create a new User entity directly, bypassing the "
-        "registration/approval lifecycle. Administrator-only in practice: "
-        "a non-administrator caller is accepted here but then always fails "
-        "with 403, since `set_role()` (needed to attach the RLS policy) is "
-        "only invoked for administrators."
+        "Create a new, already-active User directly, bypassing the "
+        "registration/approval lifecycle. `networks` is the user's access: "
+        "a list of grants `{network_name: [...], role, policy}` "
+        "(`network_name: []` = all Networks; `policy` only for `custom`). "
+        "Administrator-only."
     ),
     status_code=status.HTTP_201_CREATED,
     responses=merge(
@@ -85,12 +101,7 @@ PAYLOAD_EXAMPLE = {
         DB_TIMEOUT,
         {
             500: {
-                "description": (
-                    "Unexpected server error. Also reached, notably, by an "
-                    "invalid `role` value -- validate_rbac_role()'s "
-                    "ValueError isn't caught by a dedicated 400 handler "
-                    "here, so it falls through to this generic one instead."
-                ),
+                "description": "Unexpected server error.",
                 "content": {
                     "application/json": {"example": {"message": "Internal server error."}}
                 },
@@ -119,14 +130,14 @@ async def create_user(
                 if (
                     "username" not in payload
                     or "password" not in payload
-                    or "role" not in payload
+                    or "networks" not in payload
                 ):
                     return JSONResponse(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         content={
                             "code": 400,
                             "type": "error",
-                            "message": "Missing required properties: 'username' or 'password' or 'role'.",
+                            "message": "Missing required properties: 'username' or 'password' or 'networks'.",
                         },
                     )
 
@@ -140,10 +151,30 @@ async def create_user(
                         },
                     )
 
-                payload["role"] = validate_rbac_role(payload["role"])
-                # With NETWORK=0 there are no Networks, so a requested scope is ignored.
-                if not NETWORK:
-                    payload.pop("dataset_id", None)
+                unknown = sorted(set(payload) - _ALLOWED_KEYS)
+                if unknown:
+                    return JSONResponse(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        content={
+                            "code": 400,
+                            "type": "error",
+                            "message": "Unrecognized key(s): " + ", ".join(unknown),
+                        },
+                    )
+
+                try:
+                    grants = _GRANT_LIST.validate_python(payload.pop("networks"))
+                except ValidationError as exc:
+                    return JSONResponse(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        content={
+                            "code": 400,
+                            "type": "error",
+                            "message": "Invalid 'networks': "
+                            + str(exc.errors()[0].get("msg", "invalid")),
+                        },
+                    )
+                payload["role"] = MEMBER_ROLE  # account kind; access = grants
 
                 if current_user is not None:
                     if current_user["role"] != "administrator":
@@ -192,46 +223,35 @@ async def create_user(
                     )
                     user = {**user, "uri": generated_uri}
 
-                if payload["role"] == "sensor":
-                    commit = {
-                        "message": "Sensor data",
-                        "author": user["uri"],
-                        "encodingType": "text/plain",
-                        "user_id": user["id"],
-                    }
-                    await insert_commit(connection, commit, "CREATE")
-
-                elif payload["role"] == "qc":
-                    commit = {
-                        "message": "QC data",
-                        "author": user["uri"],
-                        "encodingType": "text/plain",
-                        "user_id": user["id"],
-                    }
-                    await insert_commit(connection, commit, "UPDATE")
+                # Validate + save the grants (also creates the fixed commit
+                # rows a sensor / qc grant needs).
+                resolved = await resolve_grants(connection, grants, admin=True)
+                await replace_user_grants(connection, user["id"], resolved)
+                granted = render_grants(resolved)
 
                 if current_user is not None:
                     await log_audit_event(
                         conn=connection,
                         action_type=AUDIT_ACTION_USER_CREATED,
                         actor_id=current_user["id"],
-                        dataset_id=payload.get("dataset_id"),
+                        network_name=granted,
                         payload={
                             "created_user_id": user["id"],
                             "username": user["username"],
-                            "role": payload["role"],
+                            "networks": granted,
                         },
                     )
 
-                # No RLS DDL needed here: as of
-                # 006_session_scoped_rls_policies.sql, every assignable
-                # role's access is enforced by static policies created once
-                # by that migration, not per-user. Creating a user is a
-                # plain INSERT + role column; a 'custom' user's narrower
-                # rule (if any) is added later via POST /Policies.
+                # No RLS DDL needed here: access is the list of grants just
+                # saved, evaluated by the static policies of
+                # 017_network_grants.sql.
 
         return Response(status_code=status.HTTP_201_CREATED)
 
+    except HTTPException as exc:
+        return JSONResponse(
+            status_code=exc.status_code, content={"message": exc.detail}
+        )
     except ValueError as exc:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,

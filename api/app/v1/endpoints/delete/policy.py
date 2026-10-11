@@ -15,6 +15,7 @@
 from app import AUTHORIZATION, POSTGRES_PORT_WRITE
 from app.db.asyncpg_db import get_pool, get_pool_w
 from app.utils.utils import pg_quote_ident
+from app.v1.endpoints.create.policy import policy_object_names
 from app.v1.endpoints.functions import set_role
 from asyncpg.exceptions import InsufficientPrivilegeError, UndefinedObjectError
 from fastapi import APIRouter, Depends, Query, status
@@ -33,7 +34,11 @@ if AUTHORIZATION:
     methods=["DELETE"],
     tags=["Policies"],
     summary="Delete a Policy",
-    description="Delete a named row-level-security policy. Administrator-only.",
+    description=(
+        "Delete a named policy (rule set) and every row-level-security "
+        "policy it created. Refused with 409 while any user still holds a "
+        "`custom` grant that uses it. Administrator-only."
+    ),
     status_code=status.HTTP_200_OK,
     responses={
         200: {"description": "Deleted. Response body is empty."},
@@ -51,6 +56,14 @@ if AUTHORIZATION:
         404: {
             "description": "No policy exists with that name.",
             "content": {"application/json": {"example": {"message": "Policy not found"}}},
+        },
+        409: {
+            "description": "A user still holds a custom grant that uses this policy.",
+            "content": {
+                "application/json": {
+                    "example": {"message": "Policy 'x' is used by 2 grant(s)."}
+                }
+            },
         },
     },
 )
@@ -71,21 +84,39 @@ async def delete_policy(
 
                     await set_role(connection, current_user)
 
-                query = """
-                    SELECT tablename FROM pg_policies
-                    WHERE policyname = $1;
-                """
-                tablename = await connection.fetchval(query, policy)
-
-                if tablename is None:
+                policy_id = await connection.fetchval(
+                    'SELECT "id" FROM sensorthings."CustomPolicy" '
+                    'WHERE "name" = $1 FOR UPDATE',
+                    policy,
+                )
+                if policy_id is None:
                     raise UndefinedObjectError()
 
-                query = (
-                    f"DROP POLICY {pg_quote_ident(policy)} "
-                    f"ON sensorthings.{pg_quote_ident(tablename)};"
+                in_use = await connection.fetchval(
+                    'SELECT count(*) FROM sensorthings."UserGrant" '
+                    'WHERE "policy_id" = $1',
+                    policy_id,
                 )
-                await connection.execute(query)
+                if in_use:
+                    return JSONResponse(
+                        status_code=status.HTTP_409_CONFLICT,
+                        content={
+                            "message": (
+                                f"Policy '{policy}' is used by {in_use} "
+                                "grant(s). Change those users' grants first."
+                            )
+                        },
+                    )
 
+                for table, policy_name in policy_object_names(policy):
+                    await connection.execute(
+                        f"DROP POLICY IF EXISTS {pg_quote_ident(policy_name)} "
+                        f"ON sensorthings.{pg_quote_ident(table)};"
+                    )
+                await connection.execute(
+                    'DELETE FROM sensorthings."CustomPolicy" WHERE "id" = $1',
+                    policy_id,
+                )
 
         return Response(status_code=status.HTTP_200_OK)
 

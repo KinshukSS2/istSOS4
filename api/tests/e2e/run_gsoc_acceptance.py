@@ -124,17 +124,20 @@ def main():
           extra_roles == "-", f"unexpected pg_roles: {extra_roles}")
 
     # ==================================================================
-    section("3. GET /Users payload  (7 new columns, no secret leak)")
+    section("3. GET /Users payload  (new columns, grants list, no secret leak)")
     # ==================================================================
     r = requests.get(f"{BASE}/Users", headers=H(admin), timeout=10)
     users = r.json().get("value", [])
     row = users[0] if users else {}
     check("GET /Users -> 200", r.status_code == 200)
-    for col in ("auth_provider", "external_sub_id", "status", "dataset_id",
-                "requested_role", "possible_duplicate_of"):
+    for col in ("auth_provider", "external_sub_id", "status", "networks",
+                "requested_networks", "possible_duplicate_of"):
         check(f"exposes new column '{col}'", col in row)
     check("does NOT expose the bcrypt hash", "password" not in row,
           "upstream had no password column at all")
+
+    net = psql('SELECT name FROM sensorthings."Network" ORDER BY id LIMIT 1')
+    net2 = psql('SELECT name FROM sensorthings."Network" ORDER BY id DESC LIMIT 1')
 
     # ==================================================================
     section("4. POST /Users -- admin-created account can log in")
@@ -142,39 +145,61 @@ def main():
     # ==================================================================
     du = f"direct_{TAG}"
     r = requests.post(f"{BASE}/Users", headers=H(admin),
-                      json={"username": du, "password": PW, "role": "viewer"},
+                      json={"username": du, "password": PW,
+                            "networks": [{"network_name": [net], "role": "viewer"}]},
                       timeout=15)
     check("POST /Users -> 2xx", 200 <= r.status_code < 300, f"HTTP {r.status_code}")
     check("the created user can actually authenticate",
           login(du, PW).status_code == 200)
     r = requests.post(f"{BASE}/Users", headers=H(admin),
                       json={"username": f"bad_{TAG}", "password": PW,
-                            "role": "not_a_role"}, timeout=15)
+                            "networks": [{"network_name": [net],
+                                          "role": "not_a_role"}]}, timeout=15)
     check("invalid role -> 400 (was an unhandled 500)", r.status_code == 400,
           f"HTTP {r.status_code}")
+    r = requests.post(f"{BASE}/Users", headers=H(admin),
+                      json={"username": f"old_{TAG}", "password": PW,
+                            "role": "viewer"}, timeout=15)
+    check("the removed single `role` field -> 400 (no silent fallback)",
+          r.status_code == 400, f"HTTP {r.status_code}")
+    r = requests.post(f"{BASE}/Users", headers=H(admin),
+                      json={"username": f"ghost_{TAG}", "password": PW,
+                            "networks": [{"network_name": ["NoSuchNetwork"],
+                                          "role": "viewer"}]}, timeout=15)
+    check("unknown Network name -> 400", r.status_code == 400,
+          f"HTTP {r.status_code}")
+    du_grants = psql(
+        "SELECT g.role || '|' || n.name FROM sensorthings.\"UserGrant\" g "
+        "JOIN sensorthings.\"UserGrantNetwork\" gn ON gn.grant_id = g.id "
+        "JOIN sensorthings.\"Network\" n ON n.id = gn.network_id "
+        f"JOIN sensorthings.\"User\" u ON u.id = g.user_id WHERE u.username = '{du}'")
+    check("the grant was saved (viewer on the chosen Network)",
+          du_grants == f"viewer|{net}", du_grants)
 
     # ==================================================================
     section("5. Self-registration -> pending waiting room  (NEW endpoint)")
     # ==================================================================
-    net = psql('SELECT name FROM sensorthings."Network" ORDER BY id LIMIT 1')
-    net2 = psql('SELECT name FROM sensorthings."Network" ORDER BY id DESC LIMIT 1')
     ru = f"reg_{TAG}"
     body = {
         "username": ru, "password": PW,
         "contact_info": {"email": f"{ru}@example.com"},
         "explanation": "gsoc acceptance run",
-        "dataset_id": net, "requested_role": "viewer",
+        "networks": [{"network_name": [net], "role": "viewer"}],
     }
     r = requests.post(f"{BASE}/Register", json=body, timeout=15)
     check("POST /Register (public, no token) -> 201", r.status_code == 201,
           f"HTTP {r.status_code}")
     reg_id = r.json().get("id") if r.status_code == 201 else None
 
-    st = psql(f"SELECT role || '|' || status || '|' || coalesce(dataset_id,'-') "
-              f"|| '|' || coalesce(requested_role,'-') "
+    st = psql(f"SELECT role || '|' || status || '|' || "
+              f"coalesce(requested_networks->0->>'role','-') || '|' || "
+              f"coalesce(requested_networks->0->'network_name'->>0,'-') "
               f"FROM sensorthings.\"User\" WHERE username = '{ru}'")
     check("row is role=pending status=pending, request recorded",
-          st == f"pending|pending|{net}|viewer", st)
+          st == f"pending|pending|viewer|{net}", st)
+    ng = psql(f"SELECT count(*) FROM sensorthings.\"UserGrant\" "
+              f"WHERE user_id = {reg_id}")
+    check("a request is NOT a grant: no access rows exist yet", ng == "0", ng)
 
     r = login(ru, PW)
     check("pending user CANNOT log in -> 403 (no dead JWT issued)",
@@ -193,22 +218,38 @@ def main():
     section("6. Admin approval + network scoping  (NEW)")
     # ==================================================================
     r = requests.patch(f"{BASE}/Users/{reg_id}/policy-approval", headers=H(admin),
-                       json={"role": "viewer", "dataset": net}, timeout=15)
-    check("PATCH /Users/{id}/policy-approval -> 200", r.status_code == 200,
-          f"HTTP {r.status_code}: {r.text[:90]}")
+                       json={}, timeout=15)
+    check("approval with neither `networks` nor `approve_as_requested` -> 422",
+          r.status_code == 422, f"HTTP {r.status_code}")
+    r = requests.patch(f"{BASE}/Users/{reg_id}/policy-approval", headers=H(admin),
+                       json={"networks": [{"network_name": [net], "role": "viewer"}],
+                             "dataset_id": net}, timeout=15)
+    check("an unknown field in the approval body -> 422 (never silently ignored)",
+          r.status_code == 422, f"HTTP {r.status_code}")
+    r = requests.patch(f"{BASE}/Users/{reg_id}/policy-approval", headers=H(admin),
+                       json={"networks": [{"network_name": ["NoSuchNetwork"],
+                                           "role": "viewer"}]}, timeout=15)
+    check("approval with an unknown Network -> 400 (validated, not silent)",
+          r.status_code == 400, f"HTTP {r.status_code}")
     st = psql(f"SELECT role || '|' || status FROM sensorthings.\"User\" "
               f"WHERE username = '{ru}'")
-    check("approved row is role=viewer status=active", st == "viewer|active", st)
+    check("...and a refused approval leaves the user pending", st == "pending|pending", st)
+
+    r = requests.patch(f"{BASE}/Users/{reg_id}/policy-approval", headers=H(admin),
+                       json={"networks": [{"network_name": [net], "role": "viewer"}]},
+                       timeout=15)
+    check("PATCH /Users/{id}/policy-approval -> 200", r.status_code == 200,
+          f"HTTP {r.status_code}: {r.text[:90]}")
+    body_ok = r.json() if r.status_code == 200 else {}
+    check("response shows requested, granted and effective access",
+          all(k in body_ok for k in ("requested", "granted", "effective", "warnings")))
+    st = psql(f"SELECT role || '|' || status FROM sensorthings.\"User\" "
+              f"WHERE username = '{ru}'")
+    check("approved row is a member, status=active", st == "member|active", st)
 
     r = login(ru, PW)
     viewer = tok_of(r)
     check("approved user can now log in", r.status_code == 200 and viewer)
-
-    r = requests.patch(f"{BASE}/Users/{reg_id}/policy-approval", headers=H(admin),
-                       json={"role": "viewer", "dataset": "NoSuchNetwork"},
-                       timeout=15)
-    check("approval with an unknown Network -> 4xx (validated, not silent)",
-          r.status_code >= 400, f"HTTP {r.status_code}")
 
     # ground truth straight from the database
     ds_net = int(psql('SELECT count(*) FROM sensorthings."Datastream" '
@@ -245,20 +286,22 @@ def main():
           f"HTTP {r.status_code}")
 
     # ==================================================================
-    section("7. Re-scoping an ACTIVE user  (NEW -- PATCH /Users/{id}/role)")
+    section("7. Changing an ACTIVE user's access  (NEW -- PATCH /Users/{id}/networks)")
     # ==================================================================
-    r = requests.patch(f"{BASE}/Users/{reg_id}/role", headers=H(admin),
-                       json={"role": "editor"}, timeout=15)
-    check("change role only -> 204", r.status_code == 204, f"HTTP {r.status_code}")
-    check("role is now editor",
-          psql(f"SELECT role FROM sensorthings.\"User\" WHERE id={reg_id}") == "editor")
-
-    r = requests.patch(f"{BASE}/Users/{reg_id}/role", headers=H(admin),
-                       json={"dataset": net2}, timeout=15)
-    check("change network scope only -> 204", r.status_code == 204,
+    r = requests.patch(f"{BASE}/Users/{reg_id}/networks", headers=H(admin),
+                       json={"networks": [{"network_name": [net], "role": "editor"}]},
+                       timeout=15)
+    check("change the role on the same Network -> 204", r.status_code == 204,
           f"HTTP {r.status_code}")
-    check("dataset_id moved to the other network",
-          psql(f"SELECT dataset_id FROM sensorthings.\"User\" WHERE id={reg_id}") == net2)
+    g = psql(f"SELECT string_agg(role, ',') FROM sensorthings.\"UserGrant\" "
+             f"WHERE user_id={reg_id}")
+    check("the saved grant is now editor", g == "editor", g)
+
+    r = requests.patch(f"{BASE}/Users/{reg_id}/networks", headers=H(admin),
+                       json={"networks": [{"network_name": [net2], "role": "editor"}]},
+                       timeout=15)
+    check("move the grant to the other Network -> 204", r.status_code == 204,
+          f"HTTP {r.status_code}")
 
     ed = tok_of(login(ru, PW))
     ds_net2 = int(psql('SELECT count(*) FROM sensorthings."Datastream" '
@@ -267,22 +310,61 @@ def main():
           count("Datastreams", ed) == ds_net2,
           f"saw {count('Datastreams', ed)}, expected {ds_net2}")
 
-    r = requests.patch(f"{BASE}/Users/{reg_id}/role", headers=H(admin),
-                       json={"dataset": "NoSuchNetwork"}, timeout=15)
-    check("unknown Network on re-scope -> 400", r.status_code == 400,
+    r = requests.patch(f"{BASE}/Users/{reg_id}/networks", headers=H(admin),
+                       json={"networks": [{"network_name": ["NoSuchNetwork"],
+                                           "role": "viewer"}]}, timeout=15)
+    check("unknown Network on a change -> 400", r.status_code == 400,
           f"HTTP {r.status_code}")
-    r = requests.patch(f"{BASE}/Users/{reg_id}/role", headers=H(admin),
+    r = requests.patch(f"{BASE}/Users/{reg_id}/networks", headers=H(admin),
                        json={}, timeout=15)
-    check("empty body -> 422 (validator requires role or dataset)",
+    check("empty body -> 422 (`networks` is required)",
           r.status_code == 422, f"HTTP {r.status_code}")
+    r = requests.patch(f"{BASE}/Users/{reg_id}/networks", headers=H(admin),
+                       json={"networks": []}, timeout=15)
+    check("an empty grant list -> 422 (deactivate the user instead)",
+          r.status_code == 422, f"HTTP {r.status_code}")
+    r = requests.patch(f"{BASE}/Users/{reg_id}/networks", headers=H(admin),
+                       json={"networks": [
+                           {"network_name": [net], "role": "viewer"},
+                           {"network_name": [net], "role": "viewer"}]}, timeout=15)
+    check("two same-role grants on the same Network -> 400", r.status_code == 400,
+          f"HTTP {r.status_code}")
 
-    # clear the scope, confirm unrestricted
-    requests.patch(f"{BASE}/Users/{reg_id}/role", headers=H(admin),
-                   json={"dataset": ""}, timeout=15)
+    # network_name [] = every Network
+    r = requests.patch(f"{BASE}/Users/{reg_id}/networks", headers=H(admin),
+                       json={"networks": [{"network_name": [], "role": "viewer"}]},
+                       timeout=15)
     ed = tok_of(login(ru, PW))
-    check('dataset="" clears the scope -> sees everything',
-          count("Datastreams", ed) == ds_all,
+    check("network_name [] grants every Network -> sees everything",
+          r.status_code == 204 and count("Datastreams", ed) == ds_all,
           f"saw {count('Datastreams', ed)}, expected {ds_all}")
+
+    # one user, different roles on different Networks
+    r = requests.patch(f"{BASE}/Users/{reg_id}/networks", headers=H(admin),
+                       json={"networks": [
+                           {"network_name": [net], "role": "viewer"},
+                           {"network_name": [net2], "role": "editor"}]}, timeout=15)
+    ed = tok_of(login(ru, PW))
+    check("viewer on one Network + editor on another -> sees both",
+          r.status_code == 204 and count("Datastreams", ed) == ds_all,
+          f"saw {count('Datastreams', ed)}, expected {ds_all}")
+    ds_a = psql('SELECT min(id) FROM sensorthings."Datastream" WHERE network_id = '
+                f"(SELECT id FROM sensorthings.\"Network\" WHERE name='{net}')")
+    ds_b = psql('SELECT min(id) FROM sensorthings."Datastream" WHERE network_id = '
+                f"(SELECT id FROM sensorthings.\"Network\" WHERE name='{net2}')")
+    if ds_a and ds_b:
+        wa = requests.patch(f"{BASE}/Datastreams({ds_a})",
+                            headers={**H(ed), "commit-message": "acceptance"},
+                            json={"description": f"x_{TAG}"}, timeout=15)
+        wb = requests.patch(f"{BASE}/Datastreams({ds_b})",
+                            headers={**H(ed), "commit-message": "acceptance"},
+                            json={"description": f"x_{TAG}"}, timeout=15)
+        check("...it may write only where it is an editor",
+              wa.status_code >= 400 and 200 <= wb.status_code < 300,
+              f"viewer-side HTTP {wa.status_code}, editor-side HTTP {wb.status_code}")
+    else:
+        check("...it may write only where it is an editor", False,
+              "could not find a datastream in each Network")
 
     # ==================================================================
     section("8. Rejection + re-application  (NEW)")
@@ -310,7 +392,7 @@ def main():
           st == "pending|pending", st)
 
     # ==================================================================
-    section("9. Policies  (reworked for the app-layer model)")
+    section("9. Policies  (named rule sets, used through a `custom` grant)")
     # ==================================================================
     r = requests.get(f"{BASE}/Policies", headers=H(admin), timeout=15)
     check("GET /Policies -> 200", r.status_code == 200, f"HTTP {r.status_code}")
@@ -318,64 +400,95 @@ def main():
     check("static RLS policies exist in the database", pol_count > 0,
           f"{pol_count} policies")
 
-    # Upstream's payload contract ({users, name, permissions}) is preserved.
     r = requests.post(f"{BASE}/Policies", headers=H(admin),
-                      json={"users": [ru], "name": f"noop_{TAG}",
+                      json={"name": f"noop_{TAG}",
                             "permissions": {"type": "viewer"}}, timeout=15)
-    check("POST /Policies type=viewer -> 400 (static policy covers it, nothing to create)",
+    check("POST /Policies type=viewer -> 400 (built in, nothing to create)",
           r.status_code == 400, f"HTTP {r.status_code}: {r.text[:80]}")
     r = requests.post(f"{BASE}/Policies", headers=H(admin),
-                      json={"users": [ru]}, timeout=15)
-    check("POST /Policies missing 'name'/'permissions' -> 400 (upstream contract)",
+                      json={"name": f"nop_{TAG}"}, timeout=15)
+    check("POST /Policies missing 'permissions' -> 400",
           r.status_code == 400, f"HTTP {r.status_code}")
+    r = requests.post(f"{BASE}/Policies", headers=H(admin),
+                      json={"users": [ru], "name": f"usr_{TAG}",
+                            "permissions": {"type": "custom", "policy": {
+                                "datastream": {"select": "true"}}}}, timeout=15)
+    check("POST /Policies with the removed `users` field -> 400",
+          r.status_code == 400, f"HTTP {r.status_code}: {r.text[:80]}")
 
     r = requests.patch(f"{BASE}/Policies", headers=H(admin), json={}, timeout=10)
     check("PATCH /Policies -> 405 (broken endpoint removed)",
           r.status_code == 405, f"HTTP {r.status_code}")
 
-    cu = f"cust_{TAG}"
-    requests.post(f"{BASE}/Users", headers=H(admin),
-                  json={"username": cu, "password": PW, "role": "custom"}, timeout=15)
-    ctok = tok_of(login(cu, PW))
-    base_custom = count("Datastreams", ctok)
-    check("a 'custom' user gets NO blanket grant (starts at 0 rows)",
-          base_custom == 0, f"saw {base_custom}")
-
     pol_name = f"cust_{TAG}"
     r = requests.post(f"{BASE}/Policies", headers=H(admin),
-                      json={"users": [cu], "name": pol_name,
+                      json={"name": pol_name,
                             "permissions": {
                                 "type": "custom",
                                 "policy": {"datastream": {"select": "id % 2 = 0"}},
                             }}, timeout=15)
     made = 200 <= r.status_code < 300
-    check("POST /Policies type=custom -> creates a scoped policy",
+    check("POST /Policies type=custom -> creates the rule set",
           made, f"HTTP {r.status_code}: {r.text[:100]}")
+    r = requests.post(f"{BASE}/Policies", headers=H(admin),
+                      json={"name": pol_name,
+                            "permissions": {"type": "custom", "policy": {
+                                "datastream": {"select": "true"}}}}, timeout=15)
+    check("the same policy name again -> 409", r.status_code == 409,
+          f"HTTP {r.status_code}")
+
+    cu = f"cust_{TAG}"
+    r = requests.post(f"{BASE}/Users", headers=H(admin),
+                      json={"username": cu, "password": PW,
+                            "networks": [{"network_name": [net], "role": "custom",
+                                          "policy": pol_name}]}, timeout=15)
+    check("POST /Users with a custom grant naming the policy -> 2xx",
+          200 <= r.status_code < 300, f"HTTP {r.status_code}: {r.text[:80]}")
+    r = requests.post(f"{BASE}/Users", headers=H(admin),
+                      json={"username": f"nopol_{TAG}", "password": PW,
+                            "networks": [{"network_name": [net], "role": "custom",
+                                          "policy": "NoSuchPolicy"}]}, timeout=15)
+    check("a custom grant naming an unknown policy -> 400",
+          r.status_code == 400, f"HTTP {r.status_code}")
+    ctok = tok_of(login(cu, PW))
     if made:
-        ctok = tok_of(login(cu, PW))
-        even = int(psql('SELECT count(*) FROM sensorthings."Datastream" WHERE id % 2 = 0'))
+        even = int(psql('SELECT count(*) FROM sensorthings."Datastream" '
+                        "WHERE id % 2 = 0 AND network_id = "
+                        f"(SELECT id FROM sensorthings.\"Network\" WHERE name='{net}')"))
         got = count("Datastreams", ctok)
-        check("the custom predicate is actually enforced by RLS",
+        check("the custom rule is enforced, and only inside the grant's Network",
               got == even, f"saw {got}, expected {even}")
         pol = psql("SELECT count(*) FROM pg_policies WHERE schemaname='sensorthings' "
-                   "AND qual LIKE '%current_app_user_id%'")
-        check("policy is group-scoped + identity clause (not a dead TO <username>)",
-              pol != "0", f"{pol} identity-scoped policies")
+                   f"AND policyname LIKE '{pol_name}%' AND qual LIKE '%app_policy_%'")
+        check("policy is group-scoped + grant lookup (not a dead TO <username>)",
+              pol != "0", f"{pol} grant-scoped policies")
         roles = psql("SELECT coalesce(string_agg(DISTINCT r, ','), '-') FROM "
                      "(SELECT unnest(roles) AS r FROM pg_policies "
                      "WHERE schemaname='sensorthings') s "
                      "WHERE r NOT IN ('user','sensor','qc','administrator','guest','public')")
         check("no policy targets a per-user PG role (the pivot holds)",
               roles == "-", f"unexpected policy roles: {roles}")
-        # create_policies() names each rule "<name>_<table>_<operation>"
+
         r = requests.delete(f"{BASE}/Policies", headers=H(admin),
-                            params={"policy": f"{pol_name}_datastream_select"},
-                            timeout=15)
-        check("DELETE /Policies -> 2xx", 200 <= r.status_code < 300,
-              f"HTTP {r.status_code}: {r.text[:80]}")
-        ctok = tok_of(login(cu, PW))
-        check("access revoked after the policy is deleted",
-              count("Datastreams", ctok) == 0, f"saw {count('Datastreams', ctok)}")
+                            params={"policy": pol_name}, timeout=15)
+        check("DELETE /Policies while a grant uses it -> 409",
+              r.status_code == 409, f"HTTP {r.status_code}: {r.text[:80]}")
+
+        cu_id = psql(f"SELECT id FROM sensorthings.\"User\" WHERE username='{cu}'")
+        requests.patch(f"{BASE}/Users/{cu_id}/networks", headers=H(admin),
+                       json={"networks": [{"network_name": [net], "role": "viewer"}]},
+                       timeout=15)
+        r = requests.delete(f"{BASE}/Policies", headers=H(admin),
+                            params={"policy": pol_name}, timeout=15)
+        check("DELETE /Policies once nothing uses it -> 2xx",
+              200 <= r.status_code < 300, f"HTTP {r.status_code}: {r.text[:80]}")
+        left = psql("SELECT count(*) FROM pg_policies WHERE schemaname='sensorthings' "
+                    f"AND policyname LIKE '{pol_name}%'")
+        check("...and every PostgreSQL policy it created is gone", left == "0", left)
+        r = requests.delete(f"{BASE}/Policies", headers=H(admin),
+                            params={"policy": pol_name}, timeout=15)
+        check("deleting it again -> 404", r.status_code == 404,
+              f"HTTP {r.status_code}")
 
     # ==================================================================
     section("10. Audit trail  (NEW -- append-only)")
@@ -449,24 +562,43 @@ def main():
     check("non-admin POST /Users -> 401/403",
           requests.post(f"{BASE}/Users", headers=H(vt),
                         json={"username": f"x{TAG}", "password": PW,
-                              "role": "viewer"}, timeout=10).status_code in (401, 403))
+                              "networks": [{"network_name": [net],
+                                            "role": "viewer"}]},
+                        timeout=10).status_code in (401, 403))
     check("non-admin can't approve -> 401/403",
           requests.patch(f"{BASE}/Users/{rid2}/policy-approval", headers=H(vt),
-                         json={"role": "viewer"}, timeout=10).status_code in (401, 403))
-    # a *valid* role, so authorization is what rejects this, not validation
-    check("non-admin can't change roles -> 401/403",
-          requests.patch(f"{BASE}/Users/{reg_id}/role", headers=H(vt),
-                         json={"role": "qc"}, timeout=10).status_code in (401, 403))
-    r = requests.patch(f"{BASE}/Users/{reg_id}/role", headers=H(admin),
-                       json={"role": "administrator"}, timeout=15)
-    check("'administrator' is not API-assignable, even by an admin -> 4xx",
+                         json={"approve_as_requested": True},
+                         timeout=10).status_code in (401, 403))
+    # a *valid* body, so authorization is what rejects this, not validation
+    check("non-admin can't change access -> 401/403",
+          requests.patch(f"{BASE}/Users/{reg_id}/networks", headers=H(vt),
+                         json={"networks": [{"network_name": [net],
+                                             "role": "qc"}]},
+                         timeout=10).status_code in (401, 403))
+    r = requests.post(f"{BASE}/Register", timeout=10, json={
+        "username": f"esc_{TAG}", "password": PW,
+        "contact_info": {"email": f"esc_{TAG}@example.com"},
+        "explanation": "x", "networks": [{"network_name": [], "role": "viewer"}]})
+    esc_id = r.json().get("id") if r.status_code == 201 else None
+    esc_grants = psql(f"SELECT count(*) FROM sensorthings.\"UserGrant\" "
+                      f"WHERE user_id = {esc_id}") if esc_id else "?"
+    check("an applicant asking for ALL Networks (`[]`) is only a request: "
+          "pending, no grant saved, cannot log in",
+          r.status_code == 201 and esc_grants == "0"
+          and login(f"esc_{TAG}", PW).status_code == 403,
+          f"HTTP {r.status_code}, grants={esc_grants}")
+    r = requests.patch(f"{BASE}/Users/{reg_id}/networks", headers=H(admin),
+                       json={"networks": [{"network_name": [net],
+                                           "role": "administrator"}]}, timeout=15)
+    check("'administrator' is not a grantable role, even by an admin -> 4xx",
           r.status_code >= 400, f"HTTP {r.status_code}")
     check("...and the target was not silently promoted",
           psql(f"SELECT role FROM sensorthings.\"User\" WHERE id={reg_id}") != "administrator")
     admins = psql("SELECT count(*) FROM sensorthings.\"User\" "
                   "WHERE role = 'administrator'")
-    r = requests.patch(f"{BASE}/Users/1/role", headers=H(admin),
-                       json={"role": "viewer"}, timeout=15)
+    r = requests.patch(f"{BASE}/Users/1/networks", headers=H(admin),
+                       json={"networks": [{"network_name": [net],
+                                           "role": "viewer"}]}, timeout=15)
     check("last administrator cannot be demoted (lockout guard)",
           r.status_code >= 400 if admins == "1" else True,
           f"HTTP {r.status_code}, {admins} admin(s)")
@@ -503,9 +635,17 @@ def main():
     cols = psql("SELECT count(*) FROM information_schema.columns "
                 "WHERE table_schema='sensorthings' AND table_name='User' "
                 "AND column_name IN ('auth_provider','external_sub_id',"
-                "'possible_duplicate_of','requested_role','dataset_id','status','password')")
-    check("all 7 identity/lifecycle columns present in the schema",
-          cols == "7", f"{cols}/7")
+                "'possible_duplicate_of','requested_networks','status','password')")
+    check("all 6 identity/lifecycle columns present in the schema",
+          cols == "6", f"{cols}/6")
+    gone = psql("SELECT count(*) FROM information_schema.columns "
+                "WHERE table_schema='sensorthings' AND table_name='User' "
+                "AND column_name IN ('dataset_id','requested_role')")
+    check("the old single-scope columns are gone", gone == "0", gone)
+    check("grant tables exist",
+          psql("SELECT count(*) FROM information_schema.tables WHERE "
+               "table_schema='sensorthings' AND table_name IN "
+               "('UserGrant','UserGrantNetwork','CustomPolicy')") == "3")
 
     # ------------------------------------------------------------------
     _report(time.time() - t0)

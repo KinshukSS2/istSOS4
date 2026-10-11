@@ -55,7 +55,7 @@ async def log_audit_event(
     conn,
     action_type: str,
     actor_id: int | None = None,
-    dataset_id: str | None = None,
+    network_name: str | list | None = None,
     payload: dict | None = None,
 ) -> None:
     """Insert a single row into sensorthings."AuditLog".
@@ -72,8 +72,8 @@ async def log_audit_event(
         actor_id:        Primary key of the sensorthings."User" row that
                          triggered the event.  Pass ``None`` for anonymous
                          (unauthenticated) actions such as PUBLIC_READ.
-        dataset_id:      Name of the Network the event concerns (requested or
-                         granted).  Optional.
+        network_name:    Network name(s) the event concerns (requested or
+                         granted). A list is stored as JSON text. Optional.
         payload:         Arbitrary JSON-serialisable metadata dict.  Optional.
                          asyncpg does not auto-serialise dicts to JSONB; this
                          function handles that conversion internally.
@@ -88,23 +88,25 @@ async def log_audit_event(
     # Serialise the payload dict to a JSON string so asyncpg can bind it as
     # JSONB.  Passing None through unchanged maps to SQL NULL.
     payload_json: str | None = json.dumps(payload) if payload is not None else None
+    if isinstance(network_name, (list, dict)):
+        network_name = json.dumps(network_name)
 
     await conn.execute(
         """
         INSERT INTO sensorthings."AuditLog"
-            (actor_id, action_type, dataset_id, payload)
+            (actor_id, action_type, network_name, payload)
         VALUES
             ($1, $2, $3, $4::jsonb)
         """,
         actor_id,
         action_type,
-        dataset_id,
+        network_name,
         payload_json,
     )
 
     logger.info(
-        "AuditLog: action=%r actor_id=%r dataset=%r",
+        "AuditLog: action=%r actor_id=%r network_name=%r",
         action_type,
         actor_id,
-        dataset_id,
+        network_name,
     )
