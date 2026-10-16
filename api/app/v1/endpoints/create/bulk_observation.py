@@ -43,12 +43,10 @@ v1 = APIRouter()
 RESULT_COLUMNS = ["resultNumber", "resultBoolean", "resultString", "resultJSON"]
 
 
-user = Header(default=None, include_in_schema=False)
+user = Depends(lambda: None)
 message = Header(default=None, alias="commit-message", include_in_schema=False)
 
 if AUTHORIZATION:
-    from app.oauth import get_current_user
-
     user = Depends(get_current_user)
 
 if VERSIONING or AUTHORIZATION:
@@ -145,8 +143,6 @@ async def bulk_observations(
                     force=force,
                 )
 
-            if current_user is not None:
-                await conn.execute("RESET ROLE;")
     return Response(status_code=status.HTTP_201_CREATED)
 
 
