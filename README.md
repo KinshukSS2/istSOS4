@@ -2,13 +2,14 @@
 
 ## Testing this branch (authentication, RBAC and RLS)
 
-The full auth/RBAC/RLS work lives on the `docs/swagger-api-documentation`
-branch of this fork.
+The full auth/RBAC/RLS work, including per-Network grants, lives on the
+`feat/network-grants` branch of this fork. The `docs/swagger-api-documentation`
+branch holds the earlier version, with one role per user.
 
 ```sh
 git clone https://github.com/KinshukSS2/istSOS4.git
 cd istSOS4
-git checkout docs/swagger-api-documentation
+git checkout feat/network-grants
 cp .env.testing .env
 docker compose up -d --build
 ```
