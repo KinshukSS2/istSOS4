@@ -30,11 +30,11 @@ Design decisions
   ensures the new account has zero privileges until an admin approves it.
 """
 
-from typing import Optional
+from typing import Annotated, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.rbac_roles import validate_rbac_role
+from app.models.networks import MAX_GRANTS, NetworkGrant
 from app.utils.utils import validate_username
 from app.validators import validate_password_strength
 
@@ -71,29 +71,28 @@ class RestrictedRegistrationRequest(BaseModel):
     ------
     username:       Desired login handle.  Uniqueness enforced at the DB level.
     password:       Plain-text password; hashed with bcrypt before storage.
-    dataset_id:     Name of the Network the applicant wants scoped access to.
-                    Optional -- omit for unrestricted access. Confirmed or
-                    overridden by the administrator at approval time.
-    requested_role: RBAC role the applicant is asking to be granted. An
-                    administrator reviewing the request sees this as the
-                    default at approval time (PATCH .../policy-approval)
-                    but can still assign a different role -- see that
-                    endpoint's docstring. This is a stated preference, not
-                    a grant: the account is created with role='pending'
-                    regardless of what is requested here.
+    networks:       The access the applicant is asking for: a list of grants,
+                    each naming Networks (``[]`` = all), a role and nothing
+                    else (a ``policy`` is chosen by the administrator, and is
+                    ignored here). This is a stated preference, not a grant:
+                    the account is created as ``pending`` and the request has
+                    no effect until an administrator approves it, replacing
+                    the list if they wish.
     explanation:    Free-text justification for the access request.  Stored
                     inside the ``contact`` JSONB blob alongside ContactInfo.
     contact_info:   Structured contact details for the applicant.
     """
 
     model_config = ConfigDict(
+        extra="forbid",
         json_schema_extra={
             "examples": [
                 {
                     "username": "jdoe",
                     "password": "Str0ng!Pass",
-                    "dataset_id": "IDROLOGIA",
-                    "requested_role": "viewer",
+                    "networks": [
+                        {"network_name": ["IDROLOGIA"], "role": "viewer"}
+                    ],
                     "explanation": "Requesting access for a climate research project.",
                     "contact_info": {"company": "SUPSI", "telegram": "@jdoe"},
                 }
@@ -114,26 +113,15 @@ class RestrictedRegistrationRequest(BaseModel):
         ),
         examples=["Str0ng!Pass"],
     )
-    dataset_id: str | None = Field(
-        default=None,
+    networks: Annotated[list[NetworkGrant], Field(min_length=1, max_length=MAX_GRANTS)] = Field(
         description=(
-            "Name of the Network the applicant is requesting scoped access "
-            "to. Optional -- omit for unrestricted access. Persisted on the "
-            "User row so an administrator reviewing the pending queue can "
-            "see it, and forwarded to the RESTRICTED_REQUEST audit event. "
-            "Ignored when the deployment runs with NETWORK=0."
+            "The access you are requesting, as a list of grants "
+            "(`network_name` list, `role`). An empty `network_name` asks for "
+            "all Networks. A stated preference, not a grant: an administrator "
+            "reviews it and decides what is actually given. Ignored when the "
+            "deployment runs with NETWORK=0 (only the roles count)."
         ),
-        examples=["IDROLOGIA"],
-    )
-    requested_role: str = Field(
-        description=(
-            "RBAC role you are asking to be granted: one of viewer, "
-            "editor, obs_manager, sensor, qc, custom. A stated "
-            "preference, not a grant -- the administrator reviewing your "
-            "request sees this as the default and can approve it as-is "
-            "or assign a different role."
-        ),
-        examples=["viewer"],
+        examples=[[{"network_name": ["IDROLOGIA"], "role": "viewer"}]],
     )
     explanation: str = Field(
         description="Free-text justification, merged into the `contact` JSONB blob alongside contact_info.",
@@ -159,18 +147,6 @@ class RestrictedRegistrationRequest(BaseModel):
                 "letters, digits, and underscores."
             )
         return v
-
-    @field_validator("requested_role")
-    @classmethod
-    def requested_role_must_be_assignable(cls, v: str) -> str:
-        """Reject an unknown or internal role at submission time, not
-        silently store it for an admin to trip over later.
-
-        Reuses the same validator the approval endpoint uses to validate
-        role, so 'requested' and 'granted' can never drift into accepting
-        different role sets.
-        """
-        return validate_rbac_role(v)
 
     @field_validator("password")
     @classmethod

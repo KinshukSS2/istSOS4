@@ -10,10 +10,10 @@
 # The two provisioning paths write different columns -- a local account has a
 # bcrypt `password` and NULL auth_provider/external_sub_id; an OIDC account is
 # the mirror image. Everything downstream (RLS, set_role, the commit trail)
-# is supposed to key off `role` and `dataset_id` only, so the two should be
+# is supposed to key off the user's grants only, so the two should be
 # indistinguishable once activated. This asserts that, instead of assuming it.
 #
-# For every role it creates BOTH kinds of user, scoped to the same Network,
+# For every role it creates BOTH kinds of user, granted on the same Network,
 # runs an identical battery of requests as each, and reports any operation
 # where the two disagree.
 #
@@ -71,17 +71,18 @@ def admin_token():
 
 
 def make_local(role, net, admin):
-    """Register -> admin approves with role + network scope -> log in."""
+    """Register -> admin approves with a grant (role on a Network) -> log in."""
     u = f"loc_{role}_{TAG}"
     requests.post(f"{BASE}/Register", timeout=20, json={
         "username": u, "password": PW,
         "contact_info": {"email": f"{u}@example.org"},
-        "explanation": "parity harness", "dataset_id": net,
-        "requested_role": role})
+        "explanation": "parity harness",
+        "networks": [{"network_name": [net], "role": role}]})
     uid = psql(f"SELECT id FROM sensorthings.\"User\" WHERE username='{u}'")
     requests.patch(f"{BASE}/Users/{uid}/policy-approval",
                    headers={"Authorization": f"Bearer {admin}"},
-                   json={"role": role, "dataset": net}, timeout=20)
+                   json={"networks": [{"network_name": [net], "role": role}]},
+                   timeout=20)
     r = requests.post(f"{BASE}/Login", data={"username": u, "password": PW},
                       timeout=15)
     return u, uid, r.json().get("access_token")
@@ -106,7 +107,8 @@ def make_oidc(role, net, admin):
                f"WHERE external_sub_id='{sub}'")
     requests.patch(f"{BASE}/Users/{uid}/policy-approval",
                    headers={"Authorization": f"Bearer {admin}"},
-                   json={"role": role, "dataset": net}, timeout=20)
+                   json={"networks": [{"network_name": [net], "role": role}]},
+                   timeout=20)
     r = oidc_roundtrip(sub, email)
     return sub, uid, r.json().get("access_token")
 
@@ -163,10 +165,14 @@ def probe(tok, uid, ctx, side, phase):
 
 
     # ---- writes on entities inside the caller's own scope ----------
+    # The PATCH values below include the unique per-(role, side) timestamp: a
+    # limited role writing the SAME value a previous step already stored is a
+    # harmless no-op that the column-limit trigger lets through, which would
+    # look like a parity break while measuring nothing about privileges.
     ds = ctx["ds_in_scope"]
     go("PATCH /Datastreams (in scope)",
        lambda: requests.patch(f"{BASE}/Datastreams({ds})", headers=hw,
-                              json={"description": f"parity {TAG} {side}"},
+                              json={"description": f"parity {TAG} {side} {ctx['ptime']}"},
                               timeout=30))
     go("PATCH /Datastreams (out of scope)",
        lambda: requests.patch(f"{BASE}/Datastreams({ctx['ds_out_scope']})",
@@ -174,7 +180,7 @@ def probe(tok, uid, ctx, side, phase):
                               timeout=30))
     go("PATCH /Things",
        lambda: requests.patch(f"{BASE}/Things({ctx['thing']})", headers=hw,
-                              json={"description": f"parity {TAG} {side}"},
+                              json={"description": f"parity {TAG} {side} {ctx['ptime']}"},
                               timeout=30))
     go("PATCH /Observations",
        lambda: requests.patch(f"{BASE}/Observations({ctx['obs']})", headers=hw,
@@ -196,10 +202,13 @@ def probe(tok, uid, ctx, side, phase):
     go("POST /Users",
        lambda: requests.post(f"{BASE}/Users", headers=h, timeout=20,
                              json={"username": f"esc_{TAG}", "password": PW,
-                                   "role": "viewer"}))
-    go("PATCH own role (escalate)",
-       lambda: requests.patch(f"{BASE}/Users/{uid}/role", headers=h,
-                              json={"role": "administrator"}, timeout=20))
+                                   "networks": [{"network_name": [],
+                                                 "role": "viewer"}]}))
+    go("PATCH own grants (escalate)",
+       lambda: requests.patch(f"{BASE}/Users/{uid}/networks", headers=h,
+                              json={"networks": [{"network_name": [],
+                                                  "role": "editor"}]},
+                              timeout=20))
 
     # ---- session / account self-service ---------------------------
     go("POST /Refresh", lambda: requests.post(f"{BASE}/Refresh", headers=h,

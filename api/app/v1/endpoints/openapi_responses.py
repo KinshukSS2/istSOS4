@@ -238,7 +238,7 @@ CONFLICT_LAST_ADMIN = {
         DetailError,
         "Refused: this is the last remaining administrator. Demoting them "
         "would leave the deployment with no one able to approve users or "
-        "reassign roles.",
+        "change Network access.",
         {
             "detail": "Cannot demote the last administrator. "
             "Promote another user to administrator first."
@@ -249,10 +249,10 @@ CONFLICT_LAST_ADMIN = {
 BAD_REQUEST_PENDING_ROLE = {
     400: response(
         DetailError,
-        "The target user is still `pending`. Role reassignment applies only "
-        "to already-activated accounts.",
+        "The target user is still `pending`. Changing Network access applies "
+        "only to already-activated accounts.",
         {
-            "detail": "Cannot reassign role for a pending user. "
+            "detail": "Cannot change a pending user here. "
             "Approve the account first via PATCH /Users/{id}/policy-approval."
         },
     )

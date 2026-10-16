@@ -12,24 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""PATCH /Users/{id}/role — administrator-only role / scope change endpoint.
+"""PATCH /Users/{id}/networks — administrator-only access change endpoint.
 
 Authorization
 -------------
 Only users with ``role == 'administrator'`` may call this endpoint.
 Any other caller receives HTTP 403 before any database interaction occurs.
 
-The endpoint changes an active user's application role and/or their Network
-scope (``User.dataset_id``); a user who wants either changed asks an
-administrator, who is the sole gatekeeper. All DB logic + edge-case guards
-live in ``role_crud.update_user_role``.
+The endpoint replaces an active user's complete list of grants (which
+Networks, with which role, and which custom policy); a user who wants more
+or less access asks an administrator, who is the sole gatekeeper. All DB
+logic + edge-case guards live in ``role_crud.update_user_networks``.
 """
 
 import logging
 
-from app.db.role_crud import update_user_role
+from app.db.role_crud import update_user_networks
 from app.models.error import DetailError
-from app.models.role import RoleUpdateRequest
+from app.models.networks import NetworksUpdateRequest
 from app.oauth import get_current_user
 from app.v1.endpoints.openapi_responses import (
     ADMIN_ERRORS,
@@ -47,16 +47,18 @@ logger = logging.getLogger(__name__)
 
 
 @v1.api_route(
-    "/Users/{user_id}/role",
+    "/Users/{user_id}/networks",
     methods=["PATCH"],
     tags=["Users"],
-    summary="Change a user's role and/or Network scope (admin only)",
+    summary="Replace a user's Networks, roles and policies (admin only)",
     description=(
-        "Change the application-layer role and/or the Network scope "
-        "(`User.dataset_id`) of an existing, active user. Send `role`, "
-        "`dataset`, or both. `dataset: \"\"` clears the scope. "
-        "Restricted to administrators. Pending users must be activated "
-        "first. The last administrator cannot be demoted. "
+        "Replace the **complete** list of grants of an existing, active "
+        "user. Each grant is `{network_name: [...], role, policy}`; "
+        "`network_name: []` grants all Networks, `policy` is only for the "
+        "`custom` role. Where several grants cover a Network the user holds "
+        "the union. Restricted to administrators. Pending users must be "
+        "approved first. Saving grants on an administrator account demotes "
+        "it to a regular member (the last administrator cannot be demoted). "
         "Roles: viewer, editor, obs_manager, sensor, qc, custom."
     ),
     status_code=status.HTTP_204_NO_CONTENT,
@@ -64,14 +66,26 @@ logger = logging.getLogger(__name__)
         {
             204: {
                 "description": (
-                    "Role changed. No response body. Also returned "
-                    "(with no database mutation) if the requested role "
-                    "matches the current one -- a deliberate no-op guard."
+                    "Access replaced. No response body. Also returned "
+                    "(with no database mutation) if the list is identical "
+                    "to the current one -- a deliberate no-op guard."
                 )
+            },
+            400: {
+                "description": (
+                    "A grant is invalid: unknown or ambiguous Network name, "
+                    "unknown policy, overlapping grants of the same role, "
+                    "or the user is still pending."
+                ),
+                "content": {
+                    "application/json": {
+                        "example": {"detail": "No Network named: 'nowhere'."}
+                    }
+                },
             },
             500: response(
                 DetailError,
-                "Unexpected database error during the role update.",
+                "Unexpected database error during the update.",
                 {"detail": "Internal server error."},
             ),
         },
@@ -81,9 +95,9 @@ logger = logging.getLogger(__name__)
         CONFLICT_LAST_ADMIN,
     ),
 )
-async def patch_user_role(
+async def patch_user_networks(
     user_id: int,
-    payload: RoleUpdateRequest,
+    payload: NetworksUpdateRequest,
     current_user=Depends(get_current_user),
 ):
     # ------------------------------------------------------------------
@@ -92,14 +106,13 @@ async def patch_user_role(
     if current_user.get("role") != "administrator":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only administrators can change user roles or scope.",
+            detail="Only administrators can change a user's access.",
         )
 
     # Delegate all business logic and guards to the CRUD layer.
-    await update_user_role(
+    await update_user_networks(
         user_id=user_id,
-        new_role=payload.role,
-        new_dataset=payload.dataset,
+        grants=payload.networks,
         actor_id=current_user.get("id"),
     )
 

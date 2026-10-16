@@ -27,3 +27,5 @@ COPY ./migrations/013_audit_user_created_role_changed.sql /docker-entrypoint-ini
 COPY ./migrations/014_history_tables_network_scoped.sql /docker-entrypoint-initdb.d/28_migration_014_history_tables_network_scoped.sql
 COPY ./migrations/015_obs_manager_foi_datastream_location.sql /docker-entrypoint-initdb.d/29_migration_015_obs_manager_foi_datastream_location.sql
 COPY ./migrations/016_dataset_id_scope_conditional_on_network.sql /docker-entrypoint-initdb.d/30_migration_016_dataset_id_scope_conditional_on_network.sql
+COPY ./migrations/017_network_grants.sql /docker-entrypoint-initdb.d/31_migration_017_network_grants.sql
+COPY ./migrations/018_drop_dataset_columns.sql /docker-entrypoint-initdb.d/32_migration_018_drop_dataset_columns.sql

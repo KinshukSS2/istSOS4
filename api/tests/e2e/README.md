@@ -46,8 +46,8 @@ istsos4-database psql` for ground-truth counts.
 1. First OIDC callback for an unknown identity → **202**, a `pending` user
    row is created with the requested Network stored on it.
 2. A second OIDC login while still pending → **202** (no token).
-3. Admin `PATCH /Users/{id}/policy-approval {role: viewer, dataset: <network>}` →
-   **200**; the row is now `viewer` scoped to that network.
+3. Admin `PATCH /Users/{id}/policy-approval {approve_as_requested: true}` →
+   **200**; the user is now a `member` with a `viewer` grant on that network.
 4. OIDC login again → **200 + a real access token**.
 5. With that token: `GET /Datastreams` count **== that network's datastream
    count** (a strict subset of the total), same for `/Observations`, and
@@ -72,3 +72,23 @@ The test relies on `GOOGLE_DISCOVERY_URL` being env-overridable (added
 alongside the existing `MICROSOFT_DISCOVERY_URL` / `ORCID_DISCOVERY_URL` /
 `EDUID_DISCOVERY_URL` overrides). That override is also what lets a real
 deployment point `google` at a private Keycloak or a staging endpoint.
+
+## Per-Network grants
+
+`run_network_grants_e2e.py` covers what only exists because a user holds a
+*list* of grants: viewer on one Network + editor on another, same Network
+with two roles (permissions add up), `network_name: []` (all Networks), a
+removed grant or a deleted Network never widening access, validation
+(unknown / ambiguous Network, overlap, policy on a non-custom grant, unknown
+fields), `approve_as_requested` vs. the administrator's own list, and the
+commit rule (a sensor/qc user commits under a fixed commit unless they also
+hold an editor / obs_manager / custom grant).
+
+```bash
+ISTSOS_BASE=http://localhost:8018/istsos4/v1.1 DB_CONTAINER=istsos4-database \
+  python api/tests/e2e/run_network_grants_e2e.py
+```
+
+`run_grants_rls_audit.py` (needs `DB_CONTAINER`) runs
+`grants_rls_audit.sql` -- every role against every operation, rolled back --
+or `grants_rls_audit_nonet.sql` on a `NETWORK=0` database.

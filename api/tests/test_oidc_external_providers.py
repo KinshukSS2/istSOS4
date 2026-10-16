@@ -40,8 +40,10 @@ Google's and GitHub's actual endpoints (see the session transcript, not a
 pytest run) -- this file does not repeat that.
 """
 
+import json
 import os
 import sys
+import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -328,9 +330,14 @@ def app_client():
         yield TestClient(app)
 
 
-def test_login_without_dataset_or_role_still_redirects(app_client):
-    # dataset_id and requested_role are optional: a plain sign-in request
-    # goes straight to the provider and the admin assigns both on approval.
+_NETWORKS_QS = "?networks=" + urllib.parse.quote(
+    json.dumps([{"network_name": ["climate"], "role": "viewer"}])
+)
+
+
+def test_login_without_networks_still_redirects(app_client):
+    # `networks` is optional: a plain sign-in request goes straight to the
+    # provider and the admin assigns the grants on approval.
     r = app_client.get(
         "/istsos4/v1.1/auth/testoidc/login", follow_redirects=False
     )
@@ -339,8 +346,7 @@ def test_login_without_dataset_or_role_still_redirects(app_client):
 
 def test_login_rejects_unconfigured_provider(app_client):
     r = app_client.get(
-        "/istsos4/v1.1/auth/not_a_real_provider/login"
-        "?dataset_id=ds://x&requested_role=viewer",
+        "/istsos4/v1.1/auth/not_a_real_provider/login" + _NETWORKS_QS,
         follow_redirects=False,
     )
     assert r.status_code == 404
@@ -349,8 +355,7 @@ def test_login_rejects_unconfigured_provider(app_client):
 
 def test_login_redirects_and_stores_selection_in_session(app_client):
     r = app_client.get(
-        "/istsos4/v1.1/auth/testoidc/login"
-        "?dataset_id=ds://climate&requested_role=viewer",
+        "/istsos4/v1.1/auth/testoidc/login" + _NETWORKS_QS,
         follow_redirects=False,
     )
     assert r.status_code == 302
@@ -362,8 +367,8 @@ def test_login_redirects_and_stores_selection_in_session(app_client):
 
 def test_callback_without_prior_login_still_registers_pending_user(app_client):
     # Hitting /callback with no session state from /login first means no
-    # dataset_id / requested_role were stashed. That is allowed now: the
-    # account is created pending, with both left for the admin to assign.
+    # `networks` was stashed. That is allowed: the account is created
+    # pending, with the grants left for the admin to assign.
     import app.db.oidc_user_crud as crud_module
     import app.v1.endpoints.create.oidc_login as route_module
 
@@ -398,9 +403,9 @@ def test_callback_without_prior_login_still_registers_pending_user(app_client):
 
     assert r.status_code == 202
     insert_args = pool.conn.fetchrow.call_args_list[-1].args
-    # trailing INSERT params: dataset_id, requested_role, possible_duplicate_of
-    assert insert_args[-3] is None
-    assert insert_args[-2] is None
+    # trailing INSERT params: requested_networks (JSON), possible_duplicate_of
+    assert json.loads(insert_args[-2]) == []
+    assert insert_args[-1] is None
 
 
 def test_callback_new_identity_creates_pending_user_and_returns_202(app_client):
@@ -422,8 +427,7 @@ def test_callback_new_identity_creates_pending_user_and_returns_202(app_client):
         route_module.oauth, "create_client", return_value=fake_client
     ):
         app_client.get(
-            "/istsos4/v1.1/auth/testoidc/login"
-            "?dataset_id=ds://climate&requested_role=viewer",
+            "/istsos4/v1.1/auth/testoidc/login" + _NETWORKS_QS,
             follow_redirects=False,
         )
 
@@ -438,7 +442,7 @@ def test_callback_new_identity_creates_pending_user_and_returns_202(app_client):
                 "uri": "/Users(42)",
                 "auth_provider": "testoidc",
                 "external_sub_id": "new-sub-1",
-                "dataset_id": "ds://climate",
+                "requested_networks": [],
             },
         )
         with patch.object(
@@ -474,15 +478,14 @@ def test_callback_existing_pending_identity_returns_202(app_client):
         "uri": "/Users(7)",
         "auth_provider": "testoidc",
         "external_sub_id": "existing-sub-1",
-        "dataset_id": "ds://climate",
+        "requested_networks": [],
     }
 
     with patch.object(
         route_module.oauth, "create_client", return_value=fake_client
     ):
         app_client.get(
-            "/istsos4/v1.1/auth/testoidc/login"
-            "?dataset_id=ds://climate&requested_role=viewer",
+            "/istsos4/v1.1/auth/testoidc/login" + _NETWORKS_QS,
             follow_redirects=False,
         )
 
@@ -518,15 +521,14 @@ def test_callback_existing_approved_identity_issues_access_token(app_client):
         "uri": "/Users(9)",
         "auth_provider": "testoidc",
         "external_sub_id": "approved-sub-1",
-        "dataset_id": "ds://climate",
+        "requested_networks": [],
     }
 
     with patch.object(
         route_module.oauth, "create_client", return_value=fake_client
     ):
         app_client.get(
-            "/istsos4/v1.1/auth/testoidc/login"
-            "?dataset_id=ds://climate&requested_role=viewer",
+            "/istsos4/v1.1/auth/testoidc/login" + _NETWORKS_QS,
             follow_redirects=False,
         )
 
@@ -590,7 +592,7 @@ def test_callback_username_collision_auto_resolves_with_suffix(app_client):
                 "uri": "/Users(77)",
                 "auth_provider": "testoidc",
                 "external_sub_id": "collide-sub-1",
-                "dataset_id": "ds://climate",
+                "requested_networks": [],
             },
         ]
     )
@@ -606,8 +608,7 @@ def test_callback_username_collision_auto_resolves_with_suffix(app_client):
         route_module.oauth, "create_client", return_value=fake_client
     ):
         app_client.get(
-            "/istsos4/v1.1/auth/testoidc/login"
-            "?dataset_id=ds://climate&requested_role=viewer",
+            "/istsos4/v1.1/auth/testoidc/login" + _NETWORKS_QS,
             follow_redirects=False,
         )
 
@@ -670,8 +671,7 @@ def test_callback_username_collision_returns_409_when_every_fallback_collides(
         route_module.oauth, "create_client", return_value=fake_client
     ):
         app_client.get(
-            "/istsos4/v1.1/auth/testoidc/login"
-            "?dataset_id=ds://climate&requested_role=viewer",
+            "/istsos4/v1.1/auth/testoidc/login" + _NETWORKS_QS,
             follow_redirects=False,
         )
 
@@ -719,7 +719,7 @@ def test_callback_github_uses_rest_api_not_id_token(app_client):
                 "uri": "/Users(55)",
                 "auth_provider": "github",
                 "external_sub_id": "555",
-                "dataset_id": "ds://climate",
+                "requested_networks": [],
             },
         )
         with patch.object(
@@ -731,3 +731,62 @@ def test_callback_github_uses_rest_api_not_id_token(app_client):
             )
 
     assert r.status_code == 202
+
+
+def test_login_rejects_invalid_networks_json(app_client):
+    r = app_client.get(
+        "/istsos4/v1.1/auth/testoidc/login?networks=not-json",
+        follow_redirects=False,
+    )
+    assert r.status_code == 400
+
+
+def test_login_rejects_unknown_grant_field(app_client):
+    bad = urllib.parse.quote(
+        json.dumps([{"network_name": ["x"], "role": "viewer", "dataset_id": "y"}])
+    )
+    r = app_client.get(
+        f"/istsos4/v1.1/auth/testoidc/login?networks={bad}",
+        follow_redirects=False,
+    )
+    assert r.status_code == 400
+
+
+def test_requested_networks_reach_the_pending_user_insert(app_client):
+    """The grants chosen before the redirect survive the round trip
+    through the session and are stored on the new pending account."""
+    import app.db.oidc_user_crud as crud_module
+    import app.v1.endpoints.create.oidc_login as route_module
+
+    fake_client = _make_fake_oidc_client(
+        {"userinfo": {"sub": "rn-sub", "email": "rn@example.org", "name": "rn"}}
+    )
+    with patch.object(
+        route_module.oauth, "create_client", return_value=fake_client
+    ):
+        app_client.get(
+            "/istsos4/v1.1/auth/testoidc/login" + _NETWORKS_QS,
+            follow_redirects=False,
+        )
+        pool = _fake_pool_for_provisioning(
+            fetchrow_result=None,
+            insert_result={
+                "id": 11,
+                "username": "rn",
+                "role": "pending",
+                "uri": "/Users(11)",
+                "auth_provider": "testoidc",
+                "external_sub_id": "rn-sub",
+                "requested_networks": [],
+            },
+        )
+        with patch.object(crud_module, "get_pool", AsyncMock(return_value=pool)):
+            r = app_client.get(
+                "/istsos4/v1.1/auth/testoidc/callback?code=abc&state=xyz",
+                follow_redirects=False,
+            )
+
+    assert r.status_code == 202
+    insert_args = pool.conn.fetchrow.call_args_list[-1].args
+    stored = json.loads(insert_args[-2])
+    assert stored == [{"network_name": ["climate"], "role": "viewer"}]

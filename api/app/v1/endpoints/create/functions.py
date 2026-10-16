@@ -16,6 +16,7 @@ import json
 from datetime import datetime
 
 from app import AUTHORIZATION, NETWORK, ST_AGGREGATE, VERSIONING
+from app.db.network_grant_crud import fixed_commit_id, uses_fixed_commit
 from app.utils.utils import (
     build_self_link,
     check_iot_id_in_payload,
@@ -54,17 +55,14 @@ async def set_commit(connection, commit_message, current_user):
     if not (VERSIONING or AUTHORIZATION):
         return None
 
-    if current_user and current_user["role"] == "sensor":
+    # A user whose writing grants are all `sensor` writes under their fixed
+    # commit and may not send a message; anyone with an editor / obs_manager
+    # / custom grant commits normally.
+    if current_user and uses_fixed_commit(current_user, "sensor"):
         if commit_message:
             raise Forbidden("Sensor cannot provide commit message")
 
-        return await connection.fetchval(
-            """
-                SELECT id FROM sensorthings."Commit"
-                WHERE user_id = $1::bigint
-            """,
-            current_user["id"],
-        )
+        return await fixed_commit_id(connection, current_user, "CREATE")
 
     if not commit_message:
         raise BadRequest("No commit message provided")

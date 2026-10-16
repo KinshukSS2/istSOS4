@@ -23,17 +23,17 @@ app.oidc_providers.normalize_claims).
 
 Flow
 ----
-1. GET /auth/{provider}/login?dataset_id=...&requested_role=...
-   The caller (whatever frontend is driving this) may let the user pick a
-   Network to be scoped to and the RBAC role they want -- both optional,
-   mirroring POST /Register. An OAuth login is a plain browser redirect
+1. GET /auth/{provider}/login?networks=<JSON list of grants>
+   The caller (whatever frontend is driving this) may let the user pick the
+   Networks and the RBAC role they want -- optional, mirroring the
+   ``networks`` field of POST /Register. An OAuth login is a plain browser redirect
    with no request body, so that selection is stashed in the server-side
    session (see the SessionMiddleware registration in app.main) before
    redirecting to the provider, the same place Authlib already stores its
    own state/nonce.
 2. Provider redirects back to /auth/{provider}/callback with a code.
 3. Exchange the code for a token; extract identity claims.
-4. Read the dataset_id/requested_role back out of the session.
+4. Read the requested networks back out of the session.
 5. Look up (auth_provider, external_sub_id):
    - Unknown identity            -> create_pending_oidc_user(), tell the
      caller to wait for admin approval. No token issued here -- OIDC login
@@ -44,9 +44,11 @@ Flow
      same create_access_token() path /Login uses.
 """
 
+import json
 import logging
 
-from app import NETWORK
+from app.db.network_grant_crud import normalise_requested
+from app.models.networks import GrantList
 from app.db.oidc_user_crud import (
     OidcUsernameCollisionError,
     create_pending_oidc_user,
@@ -54,7 +56,6 @@ from app.db.oidc_user_crud import (
 )
 from app.oauth import create_access_token
 from app.oidc_providers import ENABLED_PROVIDERS, normalize_claims, oauth
-from app.rbac_roles import validate_rbac_role
 from app.utils.utils import sanitize_username
 from app.v1.endpoints.openapi_responses import (
     BAD_GATEWAY_PROVIDER_CLAIMS,
@@ -74,6 +75,7 @@ from asyncpg.exceptions import (
 )
 from fastapi import APIRouter, HTTPException, Path, Query, Request, status
 from fastapi.responses import JSONResponse
+from pydantic import TypeAdapter, ValidationError
 
 v1 = APIRouter()
 logger = logging.getLogger(__name__)
@@ -81,8 +83,12 @@ logger = logging.getLogger(__name__)
 # Session keys used to carry the user's selection across the redirect round
 # trip -- namespaced so they can't collide with whatever Authlib itself
 # stores in the same session (its state/nonce bookkeeping).
-_SESSION_DATASET_KEY = "istsos_oidc_dataset_id"
-_SESSION_ROLE_KEY = "istsos_oidc_requested_role"
+_SESSION_NETWORKS_KEY = "istsos_oidc_requested_networks"
+
+# The session cookie is client-visible and limited to ~4 KB: keep the
+# requested list small.
+_MAX_NETWORKS_PARAM = 1500
+_GRANT_LIST = TypeAdapter(GrantList)
 
 
 def _claims_options_for(provider: str) -> dict | None:
@@ -141,10 +147,12 @@ def _client_for(provider: str):
         "from this page's own origin, and the provider will reject it with "
         "a CORS error before any redirect happens. Copy the constructed "
         "URL and open it in a browser tab instead.\n\n"
-        "`dataset_id` (a Network name) and `requested_role` are optional, "
-        "mirroring `POST /Register`. A redirect has no request body, so "
-        "any selection is stashed in the server-side session here and read "
-        "back by `/callback`."
+        "`networks` is optional and mirrors the `networks` field of "
+        "`POST /Register`: a JSON list of grants, e.g. "
+        "`[{\"network_name\": [\"psos\"], \"role\": \"viewer\"}]`. A "
+        "redirect has no request body, so the selection is stashed in the "
+        "session here and read back by `/callback`. It is only a request; "
+        "an administrator decides what is granted."
     ),
     responses=merge(
         {
@@ -158,12 +166,12 @@ def _client_for(provider: str):
                 },
             },
             400: {
-                "description": "requested_role is not one of the assignable roles.",
+                "description": "`networks` is not valid JSON, or not a valid list of grants.",
                 "content": {
                     "application/json": {
                         "example": {
-                            "message": "Invalid role. Supported roles are: "
-                            "editor, obs_manager, custom, qc, sensor, viewer"
+                            "detail": "networks must be a JSON list of "
+                            "{network_name, role} objects: Invalid role."
                         }
                     }
                 },
@@ -183,43 +191,38 @@ async def oidc_login(
         ),
         examples=["google"],
     ),
-    dataset_id: str | None = Query(
+    networks: str | None = Query(
         None,
+        max_length=_MAX_NETWORKS_PARAM,
         description=(
-            "Name of the Network the applicant is requesting scoped access "
-            "to. Optional -- omit for unrestricted access. Ignored when "
-            "the deployment runs with NETWORK=0."
+            "JSON list of requested grants, each `{network_name: [...], "
+            "role: ...}` (`network_name: []` asks for all Networks). A "
+            "stated preference, not a grant -- the account is created as "
+            "'pending' regardless. Optional."
         ),
-        examples=["IDROLOGIA"],
-    ),
-    requested_role: str | None = Query(
-        None,
-        description=(
-            "RBAC role the applicant wants: one of viewer, editor, "
-            "obs_manager, sensor, qc, custom. A stated preference, "
-            "not a grant -- the account is still created as 'pending' "
-            "regardless, and an administrator can assign a different "
-            "role at approval time. Optional."
-        ),
-        examples=["viewer"],
+        examples=['[{"network_name": ["IDROLOGIA"], "role": "viewer"}]'],
     ),
 ):
     client = _client_for(provider)
 
-    if requested_role is not None:
+    requested: list[dict] | None = None
+    if networks is not None:
         try:
-            requested_role = validate_rbac_role(requested_role)
-        except ValueError as exc:
+            grants = _GRANT_LIST.validate_python(json.loads(networks))
+        except (json.JSONDecodeError, ValidationError) as exc:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "networks must be a JSON list of {network_name, role} "
+                    f"objects: {str(exc).splitlines()[0][:120]}"
+                ),
             )
+        requested = normalise_requested(grants)
 
     # Stash the selection in the session now -- it has to survive the
     # round trip to the external provider and back, and a GET redirect has
     # no request body to carry it in directly.
-    # With NETWORK=0 there are no Networks, so a requested scope is ignored.
-    request.session[_SESSION_DATASET_KEY] = dataset_id if NETWORK else None
-    request.session[_SESSION_ROLE_KEY] = requested_role
+    request.session[_SESSION_NETWORKS_KEY] = requested
 
     redirect_uri = request.url_for("oidc_callback", provider=provider)
     return await client.authorize_redirect(request, redirect_uri)
@@ -304,8 +307,7 @@ async def oidc_callback(
     # Pop rather than get: this session is single-use for this handshake,
     # and popping avoids a stale selection leaking into a second, unrelated
     # login attempt in the same browser session. Both values are optional.
-    dataset_id = request.session.pop(_SESSION_DATASET_KEY, None)
-    requested_role = request.session.pop(_SESSION_ROLE_KEY, None)
+    requested_networks = request.session.pop(_SESSION_NETWORKS_KEY, None)
 
     try:
         existing = await get_user_by_provider_sub(
@@ -319,8 +321,7 @@ async def oidc_callback(
                     email=claims["email"],
                     auth_provider=claims["auth_provider"],
                     external_sub_id=claims["external_sub_id"],
-                    dataset_id=dataset_id,
-                    requested_role=requested_role,
+                    requested_networks=requested_networks,
                 )
             except OidcUsernameCollisionError:
                 raise HTTPException(

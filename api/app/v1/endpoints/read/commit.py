@@ -43,7 +43,7 @@ if AUTHORIZATION:
     tags=["Commits"],
     summary="Get all commits",
     description="Returns the commit history for all entities -- who "
-    "changed what, and when -- across every dataset/Network. "
+    "changed what, and when -- across every Network. "
     "Administrator-only: a Commit carries no per-Network column of its "
     "own to scope on, so any non-admin role would see every network's "
     "edit history, not just its own. Requires VERSIONING=1 in the "
